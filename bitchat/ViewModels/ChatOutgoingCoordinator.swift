@@ -10,11 +10,8 @@ import Foundation
 /// testable (see `ChatOutgoingCoordinatorContextTests`) and makes its true
 /// dependencies explicit.
 @MainActor
-protocol ChatOutgoingContext: AnyObject {
-    // MARK: Identity & channel state
-    var nickname: String { get }
-    var myPeerID: PeerID { get }
-    var activeChannel: ChannelID { get }
+protocol ChatOutgoingContext: ChatIdentityContext {
+    // MARK: Channel & selection state
     var selectedPrivateChatPeer: PeerID? { get }
     var isTeleported: Bool { get }
 
@@ -36,10 +33,6 @@ protocol ChatOutgoingContext: AnyObject {
     func recordContentKey(_ key: String, timestamp: Date)
 
     // MARK: Outbound routing
-    /// Stamps "now" as the channel's last public activity (background nudges).
-    /// (Single mutation path for the owner's `lastPublicActivityAt`; this
-    /// coordinator never reads it.)
-    func recordPublicActivity(forChannelKey key: String)
     func sendMeshMessage(_ content: String, mentions: [String], messageID: String, timestamp: Date)
     func sendGeohash(context: ChatViewModel.GeoOutgoingContext)
     /// Ships the bridged (rendezvous) copy of a just-sent public mesh
@@ -65,10 +58,6 @@ extension ChatViewModel: ChatOutgoingContext {
     // `ChatViewModel` members. The single-writer intent op below lives next to
     // its backing state's owner.
 
-    func recordPublicActivity(forChannelKey key: String) {
-        lastPublicActivityAt[key] = Date()
-    }
-
     func bridgeOutgoingPublicMessage(_ content: String, senderPeerID: PeerID, timestamp: Date) {
         BridgeService.shared.bridgeOutgoing(content: content, senderPeerID: senderPeerID, timestamp: timestamp)
     }
@@ -83,9 +72,18 @@ final class ChatOutgoingCoordinator {
     /// the message still goes out at the difficulty already reached.
     /// (Read access is internal so tests can await the send's completion.)
     private(set) var geohashMiningTask: Task<Void, Never>?
+    /// Incremented on panic wipe so any in-flight PoW mining task drops its
+    /// pre-wipe event instead of appending or publishing after the wipe.
+    private var panicGeneration: UInt64 = 0
 
     init(context: any ChatOutgoingContext) {
         self.context = context
+    }
+
+    func resetForPanic() {
+        panicGeneration &+= 1
+        geohashMiningTask?.cancel()
+        geohashMiningTask = nil
     }
 
     /// Finish any in-flight geohash PoW mining early (the pending message
@@ -143,7 +141,6 @@ private extension ChatOutgoingCoordinator {
         )
 
         appendLocalEcho(message, to: .mesh)
-        context.recordPublicActivity(forChannelKey: "mesh")
         context.sendMeshMessage(
             originalContent,
             mentions: mentions,
@@ -182,10 +179,12 @@ private extension ChatOutgoingCoordinator {
         // NIP-13 target is polled, not aborted), so it still finishes and
         // sends — and it finishes fast, so awaiting it never stacks mining
         // delays or blocks a send beyond `NostrPoW.miningTimeCap`.
+        let generation = panicGeneration
         let previousSend = geohashMiningTask
         previousSend?.cancel()
-        geohashMiningTask = Task { @MainActor [weak context = self.context] in
+        geohashMiningTask = Task { @MainActor [weak self, weak context = self.context] in
             await previousSend?.value
+            guard let self, self.panicGeneration == generation else { return }
 
             let event: NostrEvent
             do {
@@ -197,13 +196,14 @@ private extension ChatOutgoingCoordinator {
                     teleported: teleported
                 )
             } catch {
+                guard self.panicGeneration == generation else { return }
                 SecureLogger.error("❌ Failed to prepare geohash message: \(error)", category: .session)
                 context?.addSystemMessage(
                     String(localized: "system.location.send_failed", comment: "System message when a location channel send fails")
                 )
                 return
             }
-            guard let context else { return }
+            guard self.panicGeneration == generation, let context else { return }
 
             let message = BitchatMessage(
                 id: event.id,
@@ -219,7 +219,6 @@ private extension ChatOutgoingCoordinator {
             let contentKey = context.normalizedContentKey(message.content)
             context.recordContentKey(contentKey, timestamp: message.timestamp)
 
-            context.recordPublicActivity(forChannelKey: "geo:\(channel.geohash)")
             context.sendGeohash(context: (
                 channel: channel,
                 event: event,

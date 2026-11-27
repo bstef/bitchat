@@ -10,42 +10,6 @@ import AVFoundation
 import BitLogger
 import Foundation
 
-/// Owns one capture token and returns it even when the capture engine's owner
-/// disappears without reaching its normal stop/cancel path. The coordinator
-/// retains registered tokens strongly, so relying on `Token.deinit` cannot
-/// reclaim an abandoned hold.
-final class PTTCaptureSessionLease: @unchecked Sendable {
-    private let coordinator: AudioSessionCoordinator
-    private let lock = NSLock()
-    private var token: AudioSessionCoordinator.Token?
-
-    init(coordinator: AudioSessionCoordinator) {
-        self.coordinator = coordinator
-    }
-
-    func install(_ token: AudioSessionCoordinator.Token) {
-        let previous = lock.withLock {
-            let previous = self.token
-            self.token = token
-            return previous
-        }
-        previous.map(coordinator.release)
-    }
-
-    func release() {
-        let token = lock.withLock {
-            let token = self.token
-            self.token = nil
-            return token
-        }
-        token.map(coordinator.release)
-    }
-
-    deinit {
-        release()
-    }
-}
-
 /// Monotonic capture identity shared by main-actor lifecycle code and queued
 /// engine callbacks. Removing a notification observer does not cancel a block
 /// already enqueued on the main queue, so every callback must also prove it
@@ -85,7 +49,7 @@ final class PTTCaptureGeneration: @unchecked Sendable {
 ///   handles delivery to receivers that missed the live stream.
 /// `@unchecked Sendable`: every mutable property is confined to one executor —
 /// the capture `queue` (resampler/encoder/file/counters) or the main actor
-/// (`engine`, `engineStarted`, `sessionLease`, `configChangeObserver`) — so
+/// (`engine`, `engineStarted`, `sessionToken`, `configChangeObserver`) — so
 /// weak references may cross the `@Sendable` tap/notification closures, which
 /// immediately hop back to the owning executor.
 final class PTTCaptureEngine: @unchecked Sendable {
@@ -100,7 +64,7 @@ final class PTTCaptureEngine: @unchecked Sendable {
     private var engine = AVAudioEngine()
     private let queue = DispatchQueue(label: "chat.bitchat.ptt.capture", qos: .userInitiated)
     private let coordinator: AudioSessionCoordinator
-    private let sessionLease: PTTCaptureSessionLease
+    @MainActor private var sessionToken: AudioSessionCoordinator.Token?
     private let captureGeneration = PTTCaptureGeneration()
 
     // Capture-queue-confined state.
@@ -125,11 +89,6 @@ final class PTTCaptureEngine: @unchecked Sendable {
 
     init(coordinator: AudioSessionCoordinator = .shared) {
         self.coordinator = coordinator
-        self.sessionLease = PTTCaptureSessionLease(coordinator: coordinator)
-    }
-
-    deinit {
-        sessionLease.release()
     }
 
     /// Async because acquiring the session hops its blocking IPC off the main
@@ -147,7 +106,7 @@ final class PTTCaptureEngine: @unchecked Sendable {
             coordinator.release(token)
             throw CancellationError()
         }
-        sessionLease.install(token)
+        sessionToken = token
         do {
             try beginCapture(outputURL: outputURL, generation: generation)
         } catch {
@@ -189,7 +148,8 @@ final class PTTCaptureEngine: @unchecked Sendable {
         }
 
         engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.queue.async { self?.process(buffer, generation: generation) }
+            guard let copied = Self.copyPCMBuffer(buffer) else { return }
+            self?.queue.async { self?.process(copied, generation: generation) }
         }
         // Route/category changes reconfigure the engine underneath the tap;
         // stop and finalize cleanly — the .m4a captured so far still sends.
@@ -289,7 +249,7 @@ final class PTTCaptureEngine: @unchecked Sendable {
 
     @MainActor
     private func releaseSessionToken() {
-        sessionLease.release()
+        sessionToken = nil
     }
 
     // MARK: - Capture queue
@@ -322,5 +282,27 @@ final class PTTCaptureEngine: @unchecked Sendable {
             try? FileManager.default.removeItem(at: url)
         }
         fileURL = nil
+    }
+
+    /// Copies PCM samples from CoreAudio's tap buffer into an owned buffer before
+    /// handing off asynchronously so CoreAudio cannot recycle storage mid-encode.
+    private static func copyPCMBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        let frameLength = buffer.frameLength
+        guard frameLength > 0,
+              let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: frameLength)
+        else { return nil }
+        copy.frameLength = frameLength
+        let srcList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        let dstList = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+        guard srcList.count == dstList.count else { return nil }
+        for index in 0..<srcList.count {
+            let byteCount = Int(srcList[index].mDataByteSize)
+            guard byteCount > 0,
+                  let srcData = srcList[index].mData,
+                  let dstData = dstList[index].mData else { continue }
+            memcpy(dstData, srcData, byteCount)
+            dstList[index].mDataByteSize = srcList[index].mDataByteSize
+        }
+        return copy
     }
 }

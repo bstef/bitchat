@@ -19,6 +19,18 @@ final class MeshTopologyTracker {
     // Routes computed using stale topology can fail when the network has changed
     private static let routeFreshnessThreshold: TimeInterval = 60 // 60 seconds
 
+    func hasRemoteNodes(excluding localData: Data?) -> Bool {
+        let local = sanitize(localData)
+        return queue.sync {
+            if let local {
+                return claims.keys.contains { $0 != local }
+                    || lastSeen.keys.contains { $0 != local }
+                    || observedVersions.keys.contains { $0 != local }
+            }
+            return !claims.isEmpty || !lastSeen.isEmpty || !observedVersions.isEmpty
+        }
+    }
+
     func reset() {
         queue.sync(flags: .barrier) {
             self.claims.removeAll()
@@ -56,6 +68,7 @@ final class MeshTopologyTracker {
         queue.sync { claims }
     }
 
+    #if DEBUG
     func removePeer(_ data: Data?) {
         guard let peer = sanitize(data) else { return }
         queue.sync(flags: .barrier) {
@@ -64,6 +77,7 @@ final class MeshTopologyTracker {
             self.observedVersions.removeValue(forKey: peer)
         }
     }
+    #endif
 
     /// Prune nodes that haven't updated their topology in `age` seconds
     func prune(olderThan age: TimeInterval, now: Date = Date()) {

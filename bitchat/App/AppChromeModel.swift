@@ -46,12 +46,14 @@ final class AppChromeModel: ObservableObject {
         self.chatViewModel = chatViewModel
         self.onPanicWipe = onPanicWipe
         self.nickname = chatViewModel.nickname
+        self.hasUnreadPrivateMessages = !privateInboxModel.unreadPeerIDs.isEmpty
+        self.showBluetoothAlert = chatViewModel.showBluetoothAlert
+        self.bluetoothAlertMessage = chatViewModel.bluetoothAlertMessage
+        self.bluetoothState = chatViewModel.bluetoothState
+        self.torBlocked = chatViewModel.torBlocked
+        self.panicWipeBlocked = chatViewModel.panicRecoveryBlocked
 
         bind(privateInboxModel: privateInboxModel)
-    }
-
-    var shouldSuppressScreenshotNotification: Bool {
-        isLocationChannelsSheetPresented || isAppInfoPresented
     }
 
     func setNickname(_ nickname: String) {
@@ -81,7 +83,7 @@ final class AppChromeModel: ObservableObject {
     }
 
     /// Presents the App Info sheet. Pass a pane when the launching control
-    /// promises one (the header gear is labeled "settings"); nil keeps the
+    /// promises one (e.g., the gateway globe opens settings); nil keeps the
     /// sheet's own sticky last-used pane.
     func presentAppInfo(pane: AppInfoView.Pane? = nil) {
         if let pane {
@@ -151,40 +153,36 @@ final class AppChromeModel: ObservableObject {
 
     private func bind(privateInboxModel: PrivateInboxModel) {
         privateInboxModel.$unreadPeerIDs
+            .map { !$0.isEmpty }
+            .removeDuplicates()
+            .dropFirst()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] unreadPeerIDs in
-                self?.hasUnreadPrivateMessages = !unreadPeerIDs.isEmpty
+            .sink { [weak self] hasUnread in
+                guard let self, self.hasUnreadPrivateMessages != hasUnread else { return }
+                self.hasUnreadPrivateMessages = hasUnread
             }
             .store(in: &cancellables)
 
-        chatViewModel.$nickname
+        mirror(chatViewModel.$nickname, to: \.nickname)
+        mirror(chatViewModel.$showBluetoothAlert, to: \.showBluetoothAlert)
+        mirror(chatViewModel.$bluetoothAlertMessage, to: \.bluetoothAlertMessage)
+        mirror(chatViewModel.$bluetoothState, to: \.bluetoothState)
+        mirror(chatViewModel.$torBlocked, to: \.torBlocked)
+        mirror(chatViewModel.$panicRecoveryBlocked, to: \.panicWipeBlocked)
+    }
+
+    private func mirror<Value: Equatable>(
+        _ publisher: Published<Value>.Publisher,
+        to keyPath: ReferenceWritableKeyPath<AppChromeModel, Value>
+    ) {
+        publisher
+            .removeDuplicates()
+            .dropFirst()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] nickname in
-                guard let self, self.nickname != nickname else { return }
-                self.nickname = nickname
+            .sink { [weak self] value in
+                guard let self, self[keyPath: keyPath] != value else { return }
+                self[keyPath: keyPath] = value
             }
             .store(in: &cancellables)
-
-        chatViewModel.$showBluetoothAlert
-            .receive(on: DispatchQueue.main)
-            .assign(to: &$showBluetoothAlert)
-
-        chatViewModel.$bluetoothAlertMessage
-            .receive(on: DispatchQueue.main)
-            .assign(to: &$bluetoothAlertMessage)
-
-        chatViewModel.$bluetoothState
-            .receive(on: DispatchQueue.main)
-            .assign(to: &$bluetoothState)
-
-        chatViewModel.$torBlocked
-            .receive(on: DispatchQueue.main)
-            .assign(to: &$torBlocked)
-
-        chatViewModel.$panicRecoveryBlocked
-            .receive(on: DispatchQueue.main)
-            .assign(to: &$panicWipeBlocked)
-
-        hasUnreadPrivateMessages = !privateInboxModel.unreadPeerIDs.isEmpty
     }
 }

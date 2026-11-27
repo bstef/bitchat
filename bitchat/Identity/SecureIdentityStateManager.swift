@@ -6,90 +6,6 @@
 // For more information, see <https://unlicense.org>
 //
 
-///
-/// # SecureIdentityStateManager
-///
-/// Manages the persistent storage and retrieval of identity mappings with
-/// encryption at rest. This singleton service maintains the relationship between
-/// ephemeral peer IDs, cryptographic fingerprints, and social identities.
-///
-/// ## Overview
-/// The SecureIdentityStateManager provides a secure, privacy-preserving way to
-/// maintain identity relationships across app launches. It implements:
-/// - Encrypted storage of identity mappings
-/// - In-memory caching for performance
-/// - Thread-safe access patterns
-/// - Automatic debounced persistence
-///
-/// ## Architecture
-/// The manager operates at three levels:
-/// 1. **In-Memory State**: Fast access to active identities
-/// 2. **Encrypted Cache**: Persistent storage in Keychain
-/// 3. **Privacy Controls**: User-configurable persistence settings
-///
-/// ## Security Features
-///
-/// ### Encryption at Rest
-/// - Identity cache encrypted with AES-GCM
-/// - Unique 256-bit encryption key per device
-/// - Key stored separately in Keychain
-/// - No plaintext identity data on disk
-///
-/// ### Privacy by Design
-/// - Persistence is optional (user-controlled)
-/// - Minimal data retention
-/// - No cloud sync or backup
-/// - Automatic cleanup of stale entries
-///
-/// ### Thread Safety
-/// - Concurrent read access via GCD barriers
-/// - Write operations serialized
-/// - Atomic state updates
-/// - No data races or corruption
-///
-/// ## Data Model
-/// Manages three types of identity data:
-/// 1. **Ephemeral Sessions**: Current peer connections
-/// 2. **Cryptographic Identities**: Public keys and fingerprints
-/// 3. **Social Identities**: User-assigned names and trust
-///
-/// ## Persistence Strategy
-/// - Changes batched and debounced (2-second window)
-/// - Automatic save on app termination
-/// - Crash-resistant with atomic writes
-/// - Migration support for schema changes
-///
-/// ## Usage Patterns
-/// ```swift
-/// // Register a new peer identity
-/// manager.registerPeerIdentity(peerID, publicKey, fingerprint)
-/// 
-/// // Update social identity
-/// manager.updateSocialIdentity(fingerprint, nickname, trustLevel)
-/// 
-/// // Query identity
-/// let identity = manager.resolvePeerIdentity(peerID)
-/// ```
-///
-/// ## Performance Optimizations
-/// - In-memory cache eliminates Keychain roundtrips
-/// - Debounced saves reduce I/O operations
-/// - Efficient data structures for lookups
-/// - Background queue for expensive operations
-///
-/// ## Privacy Considerations
-/// - Users can disable all persistence
-/// - Identity cache can be wiped instantly
-/// - No analytics or telemetry
-/// - Ephemeral mode for high-risk users
-///
-/// ## Future Enhancements
-/// - Selective identity export
-/// - Cross-device identity sync (optional)
-/// - Identity attestation support
-/// - Advanced conflict resolution
-///
-
 import BitLogger
 import BitFoundation
 import Foundation
@@ -107,9 +23,6 @@ protocol SecureIdentityStateManagerProtocol {
     func getCryptoIdentitiesByPeerIDPrefix(_ peerID: PeerID) -> [CryptographicIdentity]
     func updateSocialIdentity(_ identity: SocialIdentity)
     
-    // MARK: Favorites Management
-    func isFavorite(fingerprint: String) -> Bool
-    
     // MARK: Blocked Users Management
     func isBlocked(fingerprint: String) -> Bool
     func setBlocked(_ fingerprint: String, isBlocked: Bool)
@@ -118,13 +31,9 @@ protocol SecureIdentityStateManagerProtocol {
     func isNostrBlocked(pubkeyHexLowercased: String) -> Bool
     func setNostrBlocked(_ pubkeyHexLowercased: String, isBlocked: Bool)
     func getBlockedNostrPubkeys() -> Set<String>
-    
-    // MARK: Ephemeral Session Management
-    func registerEphemeralSession(peerID: PeerID, handshakeState: HandshakeState)
 
     // MARK: Cleanup
     func clearAllIdentityData()
-    func removeEphemeralSession(peerID: PeerID)
     
     // MARK: Verification
     func setVerified(fingerprint: String, verified: Bool)
@@ -159,7 +68,6 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     private let encryptionKeyName = "identityCacheEncryptionKey"
     
     // In-memory state
-    private var ephemeralSessions: [PeerID: EphemeralIdentity] = [:]
     // Cryptographic identities (including pinned signing keys) live inside
     // `cache` so they persist across app restarts; see IdentityCache.
     private var cache: IdentityCache = IdentityCache()
@@ -187,12 +95,13 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     private var pendingSave = false
 
     // Encryption key
-    private let encryptionKey: SymmetricKey
+    private var encryptionKey: SymmetricKey
     /// True when `encryptionKey` is a throwaway generated this session because the
     /// persisted key could not be read (device locked / access denied). In that
     /// state we must NOT persist (it would overwrite the real cache with data the
     /// next launch can't decrypt) and must NOT delete the existing cache.
-    private let encryptionKeyIsEphemeral: Bool
+    private var encryptionKeyIsEphemeral: Bool
+    private var cacheReadUnavailable: Bool = false
     
     init(_ keychain: KeychainManagerProtocol) {
         self.keychain = keychain
@@ -257,28 +166,40 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
         // in-hand state — safe because a deallocating object has no other
         // live references, so nothing can be mutating `cache` concurrently.
         if pendingSave {
-            pendingSave = false
-            persist(snapshot: cache)
+            if persist(snapshot: cache) {
+                pendingSave = false
+            }
         }
     }
     
     // MARK: - Secure Loading/Saving
     
     private func loadIdentityCache() {
-        guard let encryptedData = keychain.getIdentityKey(forKey: cacheKey) else {
-            // No existing cache, start fresh
+        switch keychain.getIdentityKeyWithResult(forKey: cacheKey) {
+        case .success(let encryptedData):
+            do {
+                let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
+                let decryptedData = try AES.GCM.open(sealedBox, using: encryptionKey)
+                cache = try JSONDecoder().decode(IdentityCache.self, from: decryptedData)
+            } catch {
+                cache = IdentityCache()
+                let deleted = keychain.deleteIdentityKey(forKey: cacheKey)
+                SecureLogger.warning(
+                    "Discarded unreadable identity cache; starting fresh (deleted=\(deleted), error=\(error.localizedDescription))",
+                    category: .security
+                )
+            }
+
+        case .itemNotFound:
+            // Genuine first run: no existing cache, start fresh.
             return
-        }
-        
-        do {
-            let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
-            let decryptedData = try AES.GCM.open(sealedBox, using: encryptionKey)
-            cache = try JSONDecoder().decode(IdentityCache.self, from: decryptedData)
-        } catch {
-            cache = IdentityCache()
-            let deleted = keychain.deleteIdentityKey(forKey: cacheKey)
+
+        case .deviceLocked, .authenticationFailed, .accessDenied, .otherError:
+            // Transient/critical read failure: leave the persisted cache intact
+            // and avoid overwriting it during this session.
+            cacheReadUnavailable = true
             SecureLogger.warning(
-                "Discarded unreadable identity cache; starting fresh (deleted=\(deleted), error=\(error.localizedDescription))",
+                "Identity cache unavailable from keychain; refusing to overwrite persisted cache this session",
                 category: .security
             )
         }
@@ -289,12 +210,17 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     /// while serialized. The encode + keychain write are done here (already on
     /// the exclusive barrier context), synchronously, so no separate hop is
     /// scheduled and nothing is left to keep the process alive.
+    /// Leaves `pendingSave` set if the Keychain write fails so a subsequent
+    /// identical update or `forceSave()` retries persistence.
     private func saveIdentityCache() {
         pendingSave = true
         // On the barrier context already: snapshot is trivially consistent.
-        persist(snapshot: cache)
-        pendingSave = false
+        if persist(snapshot: cache) {
+            pendingSave = false
+        }
     }
+
+    private let jsonEncoder = JSONEncoder()
 
     /// Encodes, seals, and writes a *snapshot* of the cache to the keychain.
     ///
@@ -304,23 +230,28 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     /// dictionary storage, which — because `JSONEncoder` walks that storage —
     /// can spin forever (observed as a CI test-suite hang), so the snapshot
     /// must be taken on `queue`, never off it.
-    private func persist(snapshot: IdentityCache) {
-        // Never persist under an ephemeral key — it would overwrite the real
-        // cache with data the next launch cannot decrypt.
-        guard !encryptionKeyIsEphemeral else {
-            SecureLogger.debug("Skipping identity cache save (ephemeral key this session)", category: .security)
-            return
+    /// - Returns: `true` if persisted (or intentionally skipped under an ephemeral
+    ///   session key or transient cache-read failure), `false` if encoding/sealing/Keychain save failed.
+    @discardableResult
+    private func persist(snapshot: IdentityCache) -> Bool {
+        // Never persist under an ephemeral key or after a transient cache-read
+        // failure — doing so would overwrite persisted identity pins/blocks.
+        guard !encryptionKeyIsEphemeral, !cacheReadUnavailable else {
+            SecureLogger.debug("Skipping identity cache save (keychain unavailable at load)", category: .security)
+            return true
         }
 
         do {
-            let data = try JSONEncoder().encode(snapshot)
+            let data = try jsonEncoder.encode(snapshot)
             let sealedBox = try AES.GCM.seal(data, using: encryptionKey)
             let saved = keychain.saveIdentityKey(sealedBox.combined!, forKey: cacheKey)
             if saved {
                 SecureLogger.debug("Identity cache saved to keychain", category: .security)
             }
+            return saved
         } catch {
             SecureLogger.error(error, context: "Failed to save identity cache", category: .security)
+            return false
         }
     }
 
@@ -341,8 +272,9 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     func forceSave() {
         queue.sync(flags: .barrier) {
             guard pendingSave else { return }
-            pendingSave = false
-            persist(snapshot: cache)
+            if persist(snapshot: cache) {
+                pendingSave = false
+            }
         }
     }
     
@@ -376,6 +308,7 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     ///   - claimedNickname: Optional latest claimed nickname to persist into social identity
     func upsertCryptographicIdentity(fingerprint: String, noisePublicKey: Data, signingPublicKey: Data?, claimedNickname: String? = nil) {
         queue.sync(flags: .barrier) {
+            var changed = false
             let now = Date()
             if var existing = self.cache.cryptographicIdentities[fingerprint] {
                 if let pinnedSigningKey = existing.signingPublicKey,
@@ -384,21 +317,22 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
                     SecureLogger.warning("🚨 Refusing to replace pinned signing key for \(fingerprint.prefix(8))… (possible impersonation attempt)", category: .security)
                     return
                 }
-                // Update keys if changed
+                // Update keys only if changed
+                let nextSigningKey = signingPublicKey ?? existing.signingPublicKey
                 if existing.publicKey != noisePublicKey {
                     existing = CryptographicIdentity(
                         fingerprint: fingerprint,
                         publicKey: noisePublicKey,
-                        signingPublicKey: signingPublicKey ?? existing.signingPublicKey,
+                        signingPublicKey: nextSigningKey,
                         firstSeen: existing.firstSeen
                     )
                     self.cache.cryptographicIdentities[fingerprint] = existing
-                } else {
-                    // Update signing key
-                    existing.signingPublicKey = signingPublicKey ?? existing.signingPublicKey
+                    changed = true
+                } else if existing.signingPublicKey != nextSigningKey {
+                    existing.signingPublicKey = nextSigningKey
                     self.cache.cryptographicIdentities[fingerprint] = existing
+                    changed = true
                 }
-                // Persist updated state (already assigned in branches above)
             } else {
                 // New entry
                 let entry = CryptographicIdentity(
@@ -408,28 +342,35 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
                     firstSeen: now
                 )
                 self.cache.cryptographicIdentities[fingerprint] = entry
+                changed = true
             }
 
             // Optionally persist claimed nickname into social identity
             if let claimed = claimedNickname {
-                var identity = self.cache.socialIdentities[fingerprint] ?? SocialIdentity(
-                    fingerprint: fingerprint,
-                    localPetname: nil,
-                    claimedNickname: claimed,
-                    trustLevel: .unknown,
-                    isFavorite: false,
-                    isBlocked: false,
-                    notes: nil
-                )
-                // Update claimed nickname if changed
-                if identity.claimedNickname != claimed {
-                    identity.claimedNickname = claimed
-                    self.cache.socialIdentities[fingerprint] = identity
-                } else if self.cache.socialIdentities[fingerprint] == nil {
-                    self.cache.socialIdentities[fingerprint] = identity
+                if var identity = self.cache.socialIdentities[fingerprint] {
+                    if identity.claimedNickname != claimed {
+                        identity.claimedNickname = claimed
+                        self.cache.socialIdentities[fingerprint] = identity
+                        changed = true
+                    }
+                } else {
+                    self.cache.socialIdentities[fingerprint] = SocialIdentity(
+                        fingerprint: fingerprint,
+                        localPetname: nil,
+                        claimedNickname: claimed,
+                        trustLevel: .unknown,
+                        isFavorite: false,
+                        isBlocked: false,
+                        notes: nil
+                    )
+                    changed = true
                 }
             }
 
+            // Periodic peer announces re-submit identical keys and nicknames;
+            // skip JSON encoding, AES-GCM sealing, and Keychain IPC when unchanged
+            // unless a prior write failed and is still pending retry.
+            guard changed || self.pendingSave else { return }
             self.saveIdentityCache()
         }
     }
@@ -449,8 +390,11 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
         guard !fingerprint.isEmpty else { return }
         let insertAndPersist = {
             var pinned = self.cache.privateMediaCapableFingerprints ?? []
-            guard pinned.insert(fingerprint).inserted else { return }
-            self.cache.privateMediaCapableFingerprints = pinned
+            let inserted = pinned.insert(fingerprint).inserted
+            if inserted {
+                self.cache.privateMediaCapableFingerprints = pinned
+            }
+            guard inserted || self.pendingSave else { return }
             self.saveIdentityCache()
         }
         // Downgrade decisions can run immediately after an authenticated
@@ -486,7 +430,7 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
                 cryptoIdentity.signingPublicKey = signingPublicKey
                 self.cache.cryptographicIdentities[fingerprint] = cryptoIdentity
             }
-            guard bindingChanged else { return }
+            guard bindingChanged || self.pendingSave else { return }
             self.saveIdentityCache()
         }
         if DispatchQueue.getSpecific(key: queueSpecificKey) != nil {
@@ -505,65 +449,8 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     
     func updateSocialIdentity(_ identity: SocialIdentity) {
         queue.sync(flags: .barrier) {
-            let previousClaimedNickname = self.cache.socialIdentities[identity.fingerprint]?.claimedNickname
             self.cache.socialIdentities[identity.fingerprint] = identity
-            
-            // Update nickname index
-            if let previousClaimedNickname,
-               previousClaimedNickname != identity.claimedNickname {
-                self.cache.nicknameIndex[previousClaimedNickname]?.remove(identity.fingerprint)
-                if self.cache.nicknameIndex[previousClaimedNickname]?.isEmpty == true {
-                    self.cache.nicknameIndex.removeValue(forKey: previousClaimedNickname)
-                }
-            }
-            
-            // Add new nickname to index
-            if self.cache.nicknameIndex[identity.claimedNickname] == nil {
-                self.cache.nicknameIndex[identity.claimedNickname] = Set<String>()
-            }
-            self.cache.nicknameIndex[identity.claimedNickname]?.insert(identity.fingerprint)
-            
-            // Save to keychain
             self.saveIdentityCache()
-        }
-    }
-    
-    // MARK: - Favorites Management
-    
-    func getFavorites() -> Set<String> {
-        queue.sync {
-            let favorites = cache.socialIdentities.values
-                .filter { $0.isFavorite }
-                .map { $0.fingerprint }
-            return Set(favorites)
-        }
-    }
-    
-    func setFavorite(_ fingerprint: String, isFavorite: Bool) {
-        queue.sync(flags: .barrier) {
-            if var identity = self.cache.socialIdentities[fingerprint] {
-                identity.isFavorite = isFavorite
-                self.cache.socialIdentities[fingerprint] = identity
-            } else {
-                // Create new social identity for this fingerprint
-                let newIdentity = SocialIdentity(
-                    fingerprint: fingerprint,
-                    localPetname: nil,
-                    claimedNickname: "Unknown",
-                    trustLevel: .unknown,
-                    isFavorite: isFavorite,
-                    isBlocked: false,
-                    notes: nil
-                )
-                self.cache.socialIdentities[fingerprint] = newIdentity
-            }
-            self.saveIdentityCache()
-        }
-    }
-    
-    func isFavorite(fingerprint: String) -> Bool {
-        queue.sync {
-            return cache.socialIdentities[fingerprint]?.isFavorite ?? false
         }
     }
     
@@ -580,11 +467,14 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
         
         queue.sync(flags: .barrier) {
             if var identity = self.cache.socialIdentities[fingerprint] {
-                identity.isBlocked = isBlocked
-                if isBlocked {
-                    identity.isFavorite = false  // Can't be both favorite and blocked
+                let nextFavorite = isBlocked ? false : identity.isFavorite
+                let changed = identity.isBlocked != isBlocked || identity.isFavorite != nextFavorite
+                if changed {
+                    identity.isBlocked = isBlocked
+                    identity.isFavorite = nextFavorite
+                    self.cache.socialIdentities[fingerprint] = identity
                 }
-                self.cache.socialIdentities[fingerprint] = identity
+                guard changed || self.pendingSave else { return }
             } else {
                 // Create new social identity for this fingerprint
                 let newIdentity = SocialIdentity(
@@ -613,37 +503,19 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     func setNostrBlocked(_ pubkeyHexLowercased: String, isBlocked: Bool) {
         let key = pubkeyHexLowercased.lowercased()
         queue.sync(flags: .barrier) {
+            let changed: Bool
             if isBlocked {
-                self.cache.blockedNostrPubkeys.insert(key)
+                changed = self.cache.blockedNostrPubkeys.insert(key).inserted
             } else {
-                self.cache.blockedNostrPubkeys.remove(key)
+                changed = self.cache.blockedNostrPubkeys.remove(key) != nil
             }
+            guard changed || self.pendingSave else { return }
             self.saveIdentityCache()
         }
     }
     
     func getBlockedNostrPubkeys() -> Set<String> {
         queue.sync { cache.blockedNostrPubkeys }
-    }
-    
-    // MARK: - Ephemeral Session Management
-    
-    func registerEphemeralSession(peerID: PeerID, handshakeState: HandshakeState = .none) {
-        queue.async(flags: .barrier) {
-            self.ephemeralSessions[peerID] = EphemeralIdentity(handshakeState: handshakeState)
-        }
-    }
-    
-    func updateHandshakeState(peerID: PeerID, state: HandshakeState) {
-        queue.sync(flags: .barrier) {
-            self.ephemeralSessions[peerID]?.handshakeState = state
-            
-            // If handshake completed, update last interaction
-            if case .completed(let fingerprint) = state {
-                self.cache.lastInteractions[fingerprint] = Date()
-                self.saveIdentityCache()
-            }
-        }
     }
     
     // MARK: - Cleanup
@@ -653,17 +525,23 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
         
         queue.sync(flags: .barrier) {
             self.cache = IdentityCache()
-            self.ephemeralSessions.removeAll()
+            self.cacheReadUnavailable = false
+            self.pendingSave = false
 
-            // Delete from keychain
-            let deleted = self.keychain.deleteIdentityKey(forKey: self.cacheKey)
-            SecureLogger.logKeyOperation(.delete, keyType: "identity cache", success: deleted)
-        }
-    }
-    
-    func removeEphemeralSession(peerID: PeerID) {
-        queue.sync(flags: .barrier) {
-            _ = self.ephemeralSessions.removeValue(forKey: peerID)
+            // Delete the encrypted cache and previous cache encryption key from
+            // keychain, then generate and persist a fresh encryption key so
+            // post-panic blocks, verifications, and pins remain readable across
+            // the next cold launch instead of being sealed under a deleted key.
+            let deletedCache = self.keychain.deleteIdentityKey(forKey: self.cacheKey)
+            SecureLogger.logKeyOperation(.delete, keyType: "identity cache", success: deletedCache)
+            _ = self.keychain.deleteIdentityKey(forKey: self.encryptionKeyName)
+
+            let freshKey = SymmetricKey(size: .bits256)
+            let keyData = freshKey.withUnsafeBytes { Data($0) }
+            let saved = self.keychain.saveIdentityKey(keyData, forKey: self.encryptionKeyName)
+            self.encryptionKey = freshKey
+            self.encryptionKeyIsEphemeral = !saved
+            SecureLogger.logKeyOperation(.generate, keyType: "identity cache encryption key", success: saved)
         }
     }
     
@@ -802,29 +680,6 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
         }
     }
 
-    /// The trust level to display: explicit verification wins, then the
-    /// persisted level, with `vouched` layered in (derived, never persisted)
-    /// between `casual` and `trusted`.
-    func effectiveTrustLevel(for fingerprint: String) -> TrustLevel {
-        effectiveTrustLevel(for: fingerprint, now: Date())
-    }
-
-    func effectiveTrustLevel(for fingerprint: String, now: Date) -> TrustLevel {
-        queue.sync {
-            if self.cache.verifiedFingerprints.contains(fingerprint) { return .verified }
-            let stored = self.cache.socialIdentities[fingerprint]?.trustLevel ?? .unknown
-            let vouched = !self.validVouchersLocked(for: fingerprint, now: now).isEmpty
-            switch stored {
-            case .verified, .trusted:
-                return stored
-            case .vouched, .casual, .unknown:
-                if vouched { return .vouched }
-                // `.vouched` should never be persisted; degrade defensively.
-                return stored == .vouched ? .casual : stored
-            }
-        }
-    }
-
     func lastVouchBatchSent(to fingerprint: String) -> Date? {
         queue.sync { cache.vouchBatchSentAt?[fingerprint] }
     }
@@ -856,17 +711,5 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
                 }
             return Array(ordered.prefix(limit))
         }
-    }
-
-    var debugNicknameIndex: [String: Set<String>] {
-        queue.sync { cache.nicknameIndex }
-    }
-
-    func debugEphemeralSession(for peerID: PeerID) -> EphemeralIdentity? {
-        queue.sync { ephemeralSessions[peerID] }
-    }
-
-    func debugLastInteraction(for fingerprint: String) -> Date? {
-        queue.sync { cache.lastInteractions[fingerprint] }
     }
 }

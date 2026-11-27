@@ -25,50 +25,36 @@ struct ContentPeopleSheetModalPresentationState {
 struct ContentPeopleSheetView: View {
     @EnvironmentObject private var appChromeModel: AppChromeModel
     @EnvironmentObject private var privateConversationModel: PrivateConversationModel
-    @EnvironmentObject private var verificationModel: VerificationModel
     @EnvironmentObject private var conversationUIModel: ConversationUIModel
+    @Environment(\.appEnvironmentModels) private var appEnvironmentModels
     @Environment(\.scenePhase) private var scenePhase
 
     @Binding var showSidebar: Bool
-    @Binding var messageText: String
+    let draftModel: ComposerDraftModel
     @Binding var selectedMessageSender: String?
     @Binding var selectedMessageSenderID: PeerID?
     @Binding var imagePreviewURL: URL?
-    @Binding var windowCountPublic: Int
     @Binding var windowCountPrivate: [PeerID: Int]
     @Binding var isAtBottomPrivate: Bool
     var isTextFieldFocused: FocusState<Bool>.Binding
     @ObservedObject var voiceRecordingVM: VoiceRecordingViewModel
-    @Binding var autocompleteDebounceTimer: Timer?
     @State private var showVerifySheet = false
     @ThemedPalette private var palette
 
     let headerHeight: CGFloat
     let onSendMessage: () -> Void
-
-    #if os(iOS)
-    @Binding var showImagePicker: Bool
-    @Binding var imagePickerSourceType: UIImagePickerController.SourceType
-    #else
-    @Binding var showMacImagePicker: Bool
-    #endif
+    @Binding var mediaPickerMode: MediaPickerMode?
 
     private func modalPresentationState(
         includingVoiceAlert: Bool
     ) -> ContentPeopleSheetModalPresentationState {
-        #if os(iOS)
-        let isMediaPickerPresented = showImagePicker
-        #else
-        let isMediaPickerPresented = showMacImagePicker
-        #endif
-
-        return ContentPeopleSheetModalPresentationState(
+        ContentPeopleSheetModalPresentationState(
             isImagePreviewPresented: imagePreviewURL != nil,
             isVerificationSheetPresented: showVerifySheet,
             legacyPrivateMediaConsentRequest:
                 conversationUIModel.legacyPrivateMediaConsentRequest,
             isVoiceAlertPresented: includingVoiceAlert && voiceRecordingVM.showAlert,
-            isMediaPickerPresented: isMediaPickerPresented
+            isMediaPickerPresented: mediaPickerMode != nil
         )
     }
 
@@ -127,42 +113,20 @@ struct ContentPeopleSheetView: View {
         NavigationStack {
             Group {
                 if privateConversationModel.selectedPeerID != nil {
-                    #if os(iOS)
                     ContentPrivateChatSheetView(
                         showSidebar: $showSidebar,
-                        messageText: $messageText,
+                        draftModel: draftModel,
                         selectedMessageSender: $selectedMessageSender,
                         selectedMessageSenderID: $selectedMessageSenderID,
                         imagePreviewURL: $imagePreviewURL,
-                        windowCountPublic: $windowCountPublic,
                         windowCountPrivate: $windowCountPrivate,
                         isAtBottomPrivate: $isAtBottomPrivate,
                         isTextFieldFocused: isTextFieldFocused,
                         voiceRecordingVM: voiceRecordingVM,
-                        autocompleteDebounceTimer: $autocompleteDebounceTimer,
                         headerHeight: headerHeight,
                         onSendMessage: onSendMessage,
-                        showImagePicker: $showImagePicker,
-                        imagePickerSourceType: $imagePickerSourceType
+                        mediaPickerMode: $mediaPickerMode
                     )
-                    #else
-                    ContentPrivateChatSheetView(
-                        showSidebar: $showSidebar,
-                        messageText: $messageText,
-                        selectedMessageSender: $selectedMessageSender,
-                        selectedMessageSenderID: $selectedMessageSenderID,
-                        imagePreviewURL: $imagePreviewURL,
-                        windowCountPublic: $windowCountPublic,
-                        windowCountPrivate: $windowCountPrivate,
-                        isAtBottomPrivate: $isAtBottomPrivate,
-                        isTextFieldFocused: isTextFieldFocused,
-                        voiceRecordingVM: voiceRecordingVM,
-                        autocompleteDebounceTimer: $autocompleteDebounceTimer,
-                        headerHeight: headerHeight,
-                        onSendMessage: onSendMessage,
-                        showMacImagePicker: $showMacImagePicker
-                    )
-                    #endif
                 } else {
                     ContentPeopleListView(
                         showSidebar: $showSidebar,
@@ -178,7 +142,8 @@ struct ContentPeopleSheetView: View {
                     }
                 }
             )) {
-                if let peerID = appChromeModel.showingFingerprintFor {
+                if let peerID = appChromeModel.showingFingerprintFor,
+                   let verificationModel = appEnvironmentModels?.verificationModel {
                     FingerprintView(peerID: peerID)
                         .environmentObject(verificationModel)
                 }
@@ -258,64 +223,26 @@ struct ContentPeopleSheetView: View {
         #if os(macOS)
         .frame(minWidth: 420, minHeight: 520)
         #endif
-        #if os(iOS)
-        .fullScreenCover(isPresented: Binding(
-            get: { showImagePicker && (showSidebar || privateConversationModel.selectedPeerID != nil) },
-            set: { newValue in
-                if !newValue {
-                    showImagePicker = false
-                }
-            }
-        )) {
-            ImagePickerView(sourceType: imagePickerSourceType) { image in
-                showImagePicker = false
-                conversationUIModel.processSelectedImage(image)
-            }
-            .ignoresSafeArea()
-        }
-        #endif
-        #if os(macOS)
-        .sheet(isPresented: $showMacImagePicker) {
-            MacImagePickerView { url in
-                showMacImagePicker = false
-                conversationUIModel.processSelectedImage(from: url)
-            }
-        }
-        #endif
-        .alert(Text(String(localized: "voice.error.title", defaultValue: "recording error", comment: "Title of the voice recording error alert")), isPresented: voiceAlertBinding, actions: {
-            Button("common.ok", role: .cancel) {}
-            if voiceRecordingVM.state == .permissionDenied {
-                Button("location_channels.action.open_settings") {
-                    SystemSettings.microphone.open()
-                }
-            }
-        }, message: {
-            Text(voiceRecordingVM.state.alertMessage)
-        })
-        .alert(
-            "content.alert.bluetooth_required.title",
-            isPresented: bluetoothAlertBinding
-        ) {
-            Button("content.alert.bluetooth_required.settings") {
-                // Powered-off needs the radio controls, not the privacy pane.
-                (appChromeModel.bluetoothState == .poweredOff
-                    ? SystemSettings.bluetoothPower
-                    : SystemSettings.bluetooth).open()
-            }
-            Button("common.ok", role: .cancel) {}
-        } message: {
-            Text(appChromeModel.bluetoothAlertMessage)
-        }
+        .mediaPickerPresentation(
+            mode: $mediaPickerMode,
+            isActive: showSidebar || privateConversationModel.selectedPeerID != nil,
+            conversationUIModel: conversationUIModel
+        )
+        .voiceAndBluetoothAlerts(
+            voiceRecordingVM: voiceRecordingVM,
+            appChromeModel: appChromeModel,
+            isVoiceAlertPresented: voiceAlertBinding,
+            isBluetoothAlertPresented: bluetoothAlertBinding
+        )
     }
 }
 
 private struct ContentPeopleListView: View {
     @EnvironmentObject private var appChromeModel: AppChromeModel
     @EnvironmentObject private var privateConversationModel: PrivateConversationModel
-    @EnvironmentObject private var verificationModel: VerificationModel
-    @EnvironmentObject private var conversationUIModel: ConversationUIModel
     @EnvironmentObject private var locationChannelsModel: LocationChannelsModel
     @EnvironmentObject private var peerListModel: PeerListModel
+    @Environment(\.appEnvironmentModels) private var appEnvironmentModels
     @Environment(\.dismiss) private var dismiss
     @ThemedPalette private var palette
 
@@ -412,9 +339,9 @@ private struct ContentPeopleListView: View {
                             },
                             onToggleBlock: { peer in
                                 if peer.isBlocked {
-                                    conversationUIModel.unblock(peerID: peer.peerID, displayName: peer.displayName)
+                                    appEnvironmentModels?.conversationUIModel.unblock(peerID: peer.peerID, displayName: peer.displayName)
                                 } else {
-                                    conversationUIModel.block(peerID: peer.peerID, displayName: peer.displayName)
+                                    appEnvironmentModels?.conversationUIModel.block(peerID: peer.peerID, displayName: peer.displayName)
                                 }
                             }
                         )
@@ -454,8 +381,10 @@ private struct ContentPeopleListView: View {
             }
         }
         .sheet(isPresented: $showVerifySheet) {
-            VerificationSheetView(isPresented: $showVerifySheet)
-                .environmentObject(verificationModel)
+            if let verificationModel = appEnvironmentModels?.verificationModel {
+                VerificationSheetView(isPresented: $showVerifySheet)
+                    .environmentObject(verificationModel)
+            }
         }
     }
 }
@@ -471,28 +400,20 @@ private struct ContentPrivateChatSheetView: View {
     @EnvironmentObject private var privateConversationModel: PrivateConversationModel
 
     @Binding var showSidebar: Bool
-    @Binding var messageText: String
+    let draftModel: ComposerDraftModel
     @Binding var selectedMessageSender: String?
     @Binding var selectedMessageSenderID: PeerID?
     @Binding var imagePreviewURL: URL?
-    @Binding var windowCountPublic: Int
     @Binding var windowCountPrivate: [PeerID: Int]
     @Binding var isAtBottomPrivate: Bool
     var isTextFieldFocused: FocusState<Bool>.Binding
     @ObservedObject var voiceRecordingVM: VoiceRecordingViewModel
-    @Binding var autocompleteDebounceTimer: Timer?
     @Environment(\.appTheme) private var theme
     @ThemedPalette private var palette
 
     let headerHeight: CGFloat
     let onSendMessage: () -> Void
-
-    #if os(iOS)
-    @Binding var showImagePicker: Bool
-    @Binding var imagePickerSourceType: UIImagePickerController.SourceType
-    #else
-    @Binding var showMacImagePicker: Bool
-    #endif
+    @Binding var mediaPickerMode: MediaPickerMode?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -561,14 +482,12 @@ private struct ContentPrivateChatSheetView: View {
                 .modifier(PrivateHeaderChrome())
             }
 
-            MessageListView(
+            PrivateMessageListView(
                 privatePeer: privateConversationModel.selectedPeerID,
                 isAtBottom: $isAtBottomPrivate,
-                messageText: $messageText,
                 selectedMessageSender: $selectedMessageSender,
                 selectedMessageSenderID: $selectedMessageSenderID,
                 imagePreviewURL: $imagePreviewURL,
-                windowCountPublic: $windowCountPublic,
                 windowCountPrivate: $windowCountPrivate,
                 showSidebar: $showSidebar,
                 isTextFieldFocused: isTextFieldFocused
@@ -587,26 +506,13 @@ private struct ContentPrivateChatSheetView: View {
 
             privacyCaption
 
-            #if os(iOS)
             ContentComposerView(
-                messageText: $messageText,
+                draftModel: draftModel,
                 isTextFieldFocused: isTextFieldFocused,
                 voiceRecordingVM: voiceRecordingVM,
-                autocompleteDebounceTimer: $autocompleteDebounceTimer,
                 onSendMessage: onSendMessage,
-                showImagePicker: $showImagePicker,
-                imagePickerSourceType: $imagePickerSourceType
+                mediaPickerMode: $mediaPickerMode
             )
-            #else
-            ContentComposerView(
-                messageText: $messageText,
-                isTextFieldFocused: isTextFieldFocused,
-                voiceRecordingVM: voiceRecordingVM,
-                autocompleteDebounceTimer: $autocompleteDebounceTimer,
-                onSendMessage: onSendMessage,
-                showMacImagePicker: $showMacImagePicker
-            )
-            #endif
         }
         .themedSheetBackground()
         .foregroundColor(palette.primary)

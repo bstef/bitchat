@@ -38,7 +38,7 @@ struct PanicRecoveryOperations {
     }
 
     static func live(
-        fileStore: BLEIncomingFileStore = BLEIncomingFileStore(),
+        fileStore: BLEIncomingFileStore = .shared,
         defaults: UserDefaults = .standard
     ) -> PanicRecoveryOperations {
         let defaultsKey = "bitchat.panicResetPending"
@@ -94,6 +94,11 @@ struct PanicRecoveryOperations {
 }
 
 struct BLEIncomingFileStore: @unchecked Sendable {
+    /// Shared production store so `BLEService`, `PanicRecoveryOperations`,
+    /// `ChatLiveVoiceCoordinator`, and startup maintenance operate on a single
+    /// receipt cache and directory cache.
+    static let shared = BLEIncomingFileStore()
+
     enum PanicRecoveryError: Error {
         case externalMarkerCommitFailed
         case markerWriteFailed(Error)
@@ -103,14 +108,45 @@ struct BLEIncomingFileStore: @unchecked Sendable {
         )
     }
 
-    struct PrivateMediaDeletionReservation: Sendable {
-        fileprivate let id: UUID
-    }
-
-    private final class PayloadCoordination: @unchecked Sendable {
+    private final class DirectoryCache: @unchecked Sendable {
         let lock = NSLock()
-        var pendingDeliveryPaths: Set<String> = []
-        var deletionReservations: [UUID: Set<String>] = [:]
+        var filesRoot: URL?
+        var incomingDirectoryPaths: Set<String> = []
+        var createdSubdirectories: Set<String> = []
+        var pendingDeliveryCounts: [String: Int] = [:]
+
+        func invalidate() {
+            lock.lock()
+            filesRoot = nil
+            incomingDirectoryPaths.removeAll(keepingCapacity: false)
+            createdSubdirectories.removeAll(keepingCapacity: false)
+            pendingDeliveryCounts.removeAll(keepingCapacity: false)
+            lock.unlock()
+        }
+
+        func beginPendingDelivery(path: String) {
+            lock.lock()
+            pendingDeliveryCounts[path, default: 0] += 1
+            lock.unlock()
+        }
+
+        func finishPendingDelivery(path: String) {
+            lock.lock()
+            if let count = pendingDeliveryCounts[path] {
+                if count <= 1 {
+                    pendingDeliveryCounts.removeValue(forKey: path)
+                } else {
+                    pendingDeliveryCounts[path] = count - 1
+                }
+            }
+            lock.unlock()
+        }
+
+        func pendingDeliveryPathsSnapshot() -> Set<String> {
+            lock.lock()
+            defer { lock.unlock() }
+            return Set(pendingDeliveryCounts.keys)
+        }
     }
 
     private static let defaultQuotaBytes: Int64 = 100 * 1024 * 1024
@@ -119,12 +155,8 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     static let defaultMediaRetention: TimeInterval = 7 * 24 * 60 * 60
     /// Kept outside `files/` so deleting the media tree cannot erase the
     /// fail-closed startup decision before the full panic has committed.
-    private static let panicRecoveryPendingMarkerFileName =
-        ".panic-recovery-pending"
-    /// Compatibility with a short-lived development build that used the
-    /// media-specific name for the same full-transaction latch.
-    private static let legacyPanicRecoveryPendingMarkerFileName =
-        ".panic-media-wipe-pending"
+    private static let panicRecoveryPendingMarkerFileName = ".panic-recovery-pending"
+    private static let legacyPanicRecoveryPendingMarkerFileName = ".panic-media-wipe-pending"
     private static let mediaSubdirectories = [
         "voicenotes/incoming",
         "voicenotes/outgoing",
@@ -133,6 +165,19 @@ struct BLEIncomingFileStore: @unchecked Sendable {
         "files/incoming",
         "files/outgoing"
     ]
+    private static let incomingSubdirectories = [
+        "voicenotes/incoming",
+        "images/incoming",
+        "files/incoming"
+    ]
+    private static let invalidFilenameCharacters =
+        CharacterSet(charactersIn: "<>:\"|?*\0").union(.controlCharacters)
+    private static let timestampFormatterLock = NSLock()
+    private static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return formatter
+    }()
     /// Name prefix of in-flight live voice captures (progressively written by
     /// `ChatLiveVoiceCoordinator`). Quota eviction skips them by pattern —
     /// deleting one mid-stream unlinks the inode under an open `FileHandle`
@@ -140,12 +185,6 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     /// orphans a previous session left behind.
     static let liveCapturePrefix = "voice_live_"
 
-    /// Media payloads follow the same at-rest posture as the app's other
-    /// persistence layers (courier, outbox, receipt index): protected until
-    /// first unlock, so the launch-time retention sweep can still run after
-    /// a reboot. Applied to the media directories so recordings that save
-    /// as they go (live captures, `AVAudioRecorder`) inherit it, and stated
-    /// explicitly at the payload write site like every other store.
     static var mediaProtectionAttributes: [FileAttributeKey: Any]? {
         #if os(iOS)
         return [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
@@ -162,7 +201,7 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     private let panicMarkerWriter: (Data, URL) throws -> Void
     private let quotaBytes: Int64
     private let privateMediaReceipts: BLEPrivateMediaReceiptStore
-    private let payloadCoordination: PayloadCoordination
+    private let directoryCache: DirectoryCache
 
     init(
         fileManager: FileManager = .default,
@@ -183,33 +222,16 @@ struct BLEIncomingFileStore: @unchecked Sendable {
             baseDirectory: baseDirectory,
             now: dateProvider
         )
-        self.payloadCoordination = PayloadCoordination()
+        self.directoryCache = DirectoryCache()
     }
 
     /// Panic-wipe every managed incoming and outgoing media artifact before
     /// returning. Recreating the directory tree keeps later capture/receive
     /// paths usable without allowing a detached cleanup task to race them.
-    ///
-    /// Marker persistence and deletion are deliberately separate error
-    /// domains: even when both durable marker channels fail, deletion is
-    /// still attempted before this method reports the marker failure.
-    func panicWipe(
-        hasDurablePendingMarker: Bool = false
-    ) throws {
-        // The receipt index caches tombstones as well as accepted payloads,
-        // while payload coordination retains save/delete reservations. Always
-        // invalidate both on return, including partial-failure paths, so no
-        // pre-panic receiver decision survives after identity reset.
+    func panicWipe(hasDurablePendingMarker: Bool = false) throws {
         defer {
             privateMediaReceipts.resetForPanic()
-            payloadCoordination.lock.lock()
-            payloadCoordination.pendingDeliveryPaths.removeAll(
-                keepingCapacity: false
-            )
-            payloadCoordination.deletionReservations.removeAll(
-                keepingCapacity: false
-            )
-            payloadCoordination.lock.unlock()
+            directoryCache.invalidate()
         }
 
         let markerError: Error?
@@ -232,10 +254,7 @@ struct BLEIncomingFileStore: @unchecked Sendable {
             }
             for subdirectory in Self.mediaSubdirectories {
                 try fileManager.createDirectory(
-                    at: filesDirectory.appendingPathComponent(
-                        subdirectory,
-                        isDirectory: true
-                    ),
+                    at: filesDirectory.appendingPathComponent(subdirectory, isDirectory: true),
                     withIntermediateDirectories: true,
                     attributes: Self.mediaProtectionAttributes
                 )
@@ -281,11 +300,12 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     /// Resolves (and creates) an incoming-media directory for callers that
     /// write progressively instead of via `save` (live voice captures).
     func incomingDirectory(subdirectory: String) throws -> URL {
-        let directory = try filesDirectory().appendingPathComponent(subdirectory, isDirectory: true)
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: Self.mediaProtectionAttributes)
-        return directory
+        try ensureSubdirectory(subdirectory)
     }
 
+    /// Writes an incoming payload to a globally unique `<uuid>_<sanitizedName>`
+    /// file so distinct transfers, retries, and post-eviction arrivals never
+    /// collide on a shared basename.
     func save(
         data: Data,
         preferredName: String?,
@@ -293,41 +313,19 @@ struct BLEIncomingFileStore: @unchecked Sendable {
         fallbackExtension: String?,
         defaultPrefix: String
     ) -> URL? {
-        payloadCoordination.lock.lock()
-        defer { payloadCoordination.lock.unlock() }
-
         do {
-            let base = try filesDirectory().appendingPathComponent(subdirectory, isDirectory: true)
-            try fileManager.createDirectory(at: base, withIntermediateDirectories: true, attributes: Self.mediaProtectionAttributes)
+            let base = try ensureSubdirectory(subdirectory)
             let sanitized = sanitizedFileName(
                 preferredName,
                 defaultName: "\(defaultPrefix)_\(Self.timestampString(from: dateProvider()))",
                 fallbackExtension: fallbackExtension
             )
-            let reservedPaths = privateMediaReceipts.reservedPayloadPaths()
-            let deletionPaths = payloadCoordination
-                .deletionReservations.values.reduce(into: Set<String>()) {
-                    $0.formUnion($1)
-                }
-            let allocationReservations = deletionPaths.union(
-                payloadCoordination.pendingDeliveryPaths
-            )
-            let destination = uniqueFileURL(
-                in: base,
-                fileName: sanitized,
-                reservedPaths: (reservedPaths ?? []).union(
-                    allocationReservations
-                ),
-                forceRandomizedName: reservedPaths == nil
-            )
+            let destination = uniqueFileURL(in: base, sanitizedName: sanitized)
             var options: Data.WritingOptions = [.atomic]
             #if os(iOS)
             options.insert(.completeFileProtectionUntilFirstUserAuthentication)
             #endif
             try data.write(to: destination, options: options)
-            payloadCoordination.pendingDeliveryPaths.insert(
-                destination.standardizedFileURL.path
-            )
             return destination
         } catch {
             SecureLogger.error("❌ Failed to persist incoming media: \(error)", category: .session)
@@ -335,119 +333,50 @@ struct BLEIncomingFileStore: @unchecked Sendable {
         }
     }
 
-    /// Drops THIS instance's in-memory receipt index after a panic wipe.
-    ///
-    /// `panicWipe` already resets the receipt store it runs on, but the
-    /// production wipe runs on the `PanicRecoveryOperations.live()` file
-    /// store while receipt lookups are served by `BLEService`'s own
-    /// `incomingFileStore`. The service's panic path must invalidate its own
-    /// cache explicitly or pre-panic decisions survive in memory.
     func resetPrivateMediaReceiptsForPanic() {
         privateMediaReceipts.resetForPanic()
     }
 
-    func privateMediaReceiptState(
-        messageID: String
-    ) -> BLEPrivateMediaReceiptState {
+    /// Marks an incoming file as awaiting asynchronous UI delivery so quota
+    /// eviction and age-based retention cannot unlink it before the UI receives
+    /// the message. Ref-counted per standardized path.
+    func beginPendingDelivery(at url: URL) {
+        directoryCache.beginPendingDelivery(path: url.standardizedFileURL.path)
+    }
+
+    func finishPendingDelivery(at url: URL) {
+        directoryCache.finishPendingDelivery(path: url.standardizedFileURL.path)
+    }
+
+    func privateMediaReceiptState(messageID: String) -> BLEPrivateMediaReceiptState {
         privateMediaReceipts.state(for: messageID)
     }
 
-    func commitPrivateMediaFile(
-        messageID: String,
-        storedURL: URL
-    ) -> Bool {
-        privateMediaReceipts.commitAccepted(
-            messageID: messageID,
-            storedURL: storedURL
-        )
-    }
-
-    /// Reserves every receipt/UI path before the asynchronous deletion
-    /// barrier. Allocation and reservation share one lock, so either an
-    /// in-flight raw arrival is observed and deletion fails closed, or the
-    /// arrival is forced onto a different filename.
-    func reservePrivateMediaDeletion(
-        messageIDs: [String],
-        payloadRelativePaths: [String: String]
-    ) -> PrivateMediaDeletionReservation? {
-        payloadCoordination.lock.lock()
-        defer { payloadCoordination.lock.unlock() }
-
-        guard let paths = privateMediaReceipts
-            .prospectiveDeletionPayloadPaths(
-                messageIDs: messageIDs,
-                payloadRelativePaths: payloadRelativePaths
-            ),
-        paths.isDisjoint(
-            with: payloadCoordination.pendingDeliveryPaths
-        ) else {
-            return nil
-        }
-
-        let reservation = PrivateMediaDeletionReservation(id: UUID())
-        payloadCoordination.deletionReservations[reservation.id] = paths
-        return reservation
+    func commitPrivateMediaFile(messageID: String, storedURL: URL) -> Bool {
+        privateMediaReceipts.commitAccepted(messageID: messageID, storedURL: storedURL)
     }
 
     func commitPrivateMediaDeletion(
-        reservation: PrivateMediaDeletionReservation,
         messageIDs: [String],
-        payloadRelativePaths: [String: String],
-        protectedPayloadRelativePaths: Set<String>
+        payloadRelativePaths: [String: String]
     ) -> Bool {
-        payloadCoordination.lock.lock()
-        defer {
-            payloadCoordination.deletionReservations.removeValue(
-                forKey: reservation.id
-            )
-            payloadCoordination.lock.unlock()
-        }
-        guard payloadCoordination.deletionReservations[reservation.id] != nil
-        else {
-            return false
-        }
-        return privateMediaReceipts.recordDeleted(
+        privateMediaReceipts.recordDeleted(
             messageIDs: messageIDs,
-            payloadRelativePaths: payloadRelativePaths,
-            protectedPayloadRelativePaths: protectedPayloadRelativePaths
+            payloadRelativePaths: payloadRelativePaths
         )
     }
 
-    /// Explicit deletion of a LEGACY (non-stable-ID) incoming payload.
-    ///
-    /// Legacy media has no durable receipt, so the only safe unlink is one
-    /// that can prove no other owner may hold the basename: the path must
-    /// not be pending delivery, must not belong to an in-flight deletion
-    /// reservation, and must not be owned by a stable receipt or journal
-    /// entry. When any of those hold — or receipt state cannot be read —
-    /// the file stays for bounded quota cleanup (the fail-safe fallback).
-    /// Returns true only when the payload was verifiably unlinked.
+    /// Explicit deletion of a legacy (non-stable-ID) incoming payload.
+    /// Deletes only regular files directly inside an incoming media directory
+    /// that are not owned by any stable receipt.
     @discardableResult
     func removeLegacyIncomingFile(relativePath: String) -> Bool {
-        payloadCoordination.lock.lock()
-        defer { payloadCoordination.lock.unlock() }
-
-        guard let payload = incomingPayloadURL(
-            relativePath: relativePath
-        ) else {
-            return false
-        }
-        let standardizedPath = payload.standardizedFileURL.path
-        let reservedByDeletion = payloadCoordination.deletionReservations
-            .values.contains { $0.contains(standardizedPath) }
-        guard !reservedByDeletion,
-              !payloadCoordination.pendingDeliveryPaths.contains(
-                  standardizedPath
-              ),
-              let receiptOwnedPaths =
-                privateMediaReceipts.reservedPayloadPaths(),
-              !receiptOwnedPaths.contains(standardizedPath) else {
+        guard let payload = incomingPayloadURL(relativePath: relativePath),
+              privateMediaReceipts.isPayloadOwned(relativePath: relativePath) == false else {
             return false
         }
         guard fileManager.fileExists(atPath: payload.path),
-              (try? payload.resourceValues(
-                  forKeys: [.isRegularFileKey]
-              ).isRegularFile) == true else {
+              (try? payload.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
             return false
         }
         do {
@@ -462,52 +391,9 @@ struct BLEIncomingFileStore: @unchecked Sendable {
         }
     }
 
-    /// Resolves a `files/`-relative path iff it lands directly inside one of
-    /// the incoming media directories. Anything else is not a deletable
-    /// incoming payload.
-    private func incomingPayloadURL(relativePath: String) -> URL? {
-        guard !relativePath.isEmpty,
-              let base = try? filesDirectory().standardizedFileURL else {
-            return nil
-        }
-        let candidate = base
-            .appendingPathComponent(relativePath, isDirectory: false)
-            .standardizedFileURL
-        let parentPath = candidate.deletingLastPathComponent().path
-        let incomingDirectories = [
-            "voicenotes/incoming",
-            "images/incoming",
-            "files/incoming"
-        ]
-        guard incomingDirectories.contains(where: { relativeDirectory in
-            base.appendingPathComponent(
-                relativeDirectory,
-                isDirectory: true
-            ).standardizedFileURL.path == parentPath
-        }) else {
-            return nil
-        }
-        return candidate
-    }
-
-    /// Releases the short window between disk save and synchronous
-    /// conversation insertion. Before this callback, a deletion transaction
-    /// may not infer ownership from a stale bubble that names the same path.
-    func finishIncomingFileDelivery(at storedURL: URL) {
-        payloadCoordination.lock.lock()
-        defer { payloadCoordination.lock.unlock() }
-        payloadCoordination.pendingDeliveryPaths.remove(
-            storedURL.standardizedFileURL.path
-        )
-    }
-
-    /// Best-effort rollback for a payload whose durable receipt commit failed.
+    /// Best-effort rollback for a payload whose durable receipt commit failed
+    /// or whose raw delivery was rejected.
     func removeIncomingFile(at storedURL: URL) {
-        payloadCoordination.lock.lock()
-        defer { payloadCoordination.lock.unlock() }
-        payloadCoordination.pendingDeliveryPaths.remove(
-            storedURL.standardizedFileURL.path
-        )
         guard isURLInsideFilesDirectory(storedURL) else { return }
         do {
             try fileManager.removeItem(at: storedURL)
@@ -520,29 +406,21 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     }
 
     /// Frees least-recently-modified incoming files until `reservingBytes`
-    /// fits under the quota. Files named `voice_live_*` (in-flight live
-    /// captures) are never evicted regardless of who triggers enforcement —
-    /// a finalized transfer can arrive at quota while a burst is still
-    /// streaming — but they still count toward usage.
+    /// fits under the quota. In-flight `voice_live_*` captures are never evicted
+    /// but still count toward usage.
     func enforceQuota(reservingBytes: Int) {
-        payloadCoordination.lock.lock()
-        defer { payloadCoordination.lock.unlock() }
-
         do {
             let base = try filesDirectory()
-            let incomingDirs = [
-                base.appendingPathComponent("voicenotes/incoming", isDirectory: true),
-                base.appendingPathComponent("images/incoming", isDirectory: true),
-                base.appendingPathComponent("files/incoming", isDirectory: true)
-            ]
             var allFiles: [(url: URL, size: Int64, modified: Date)] = []
 
-            for dir in incomingDirs where fileManager.fileExists(atPath: dir.path) {
-                guard let contents = try? fileManager.contentsOfDirectory(
-                    at: dir,
-                    includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
-                    options: [.skipsHiddenFiles]
-                ) else { continue }
+            for subdirectory in Self.incomingSubdirectories {
+                let dir = base.appendingPathComponent(subdirectory, isDirectory: true)
+                guard fileManager.fileExists(atPath: dir.path),
+                      let contents = try? fileManager.contentsOfDirectory(
+                          at: dir,
+                          includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+                          options: [.skipsHiddenFiles]
+                      ) else { continue }
 
                 for fileURL in contents {
                     guard let attrs = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
@@ -557,22 +435,12 @@ struct BLEIncomingFileStore: @unchecked Sendable {
             guard currentUsage > targetUsage else { return }
 
             let needToFree = currentUsage - targetUsage
-            let activeDeletionPaths = payloadCoordination
-                .deletionReservations.values.reduce(into: Set<String>()) {
-                    $0.formUnion($1)
-                }
-            let protectedPaths = activeDeletionPaths.union(
-                payloadCoordination.pendingDeliveryPaths
-            )
+            let protectedPaths = directoryCache.pendingDeliveryPathsSnapshot()
             var freedSpace: Int64 = 0
             for file in allFiles.sorted(by: { $0.modified < $1.modified }) {
                 guard freedSpace < needToFree else { break }
-                guard !file.url.lastPathComponent.hasPrefix(Self.liveCapturePrefix) else { continue }
-                guard !protectedPaths.contains(
-                    file.url.standardizedFileURL.path
-                ) else {
-                    continue
-                }
+                guard !file.url.lastPathComponent.hasPrefix(Self.liveCapturePrefix),
+                      !protectedPaths.contains(file.url.standardizedFileURL.path) else { continue }
                 do {
                     try fileManager.removeItem(at: file.url)
                     freedSpace += file.size
@@ -591,54 +459,34 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     }
 
     /// Deletes managed media older than `retention`, across both incoming and
-    /// outgoing directories, and reports how many files went away.
-    ///
-    /// The quota sweep above only bounds *size*, and only for incoming files,
-    /// so a received photo or a sent voice note could sit on disk unbounded in
-    /// time — long outliving the conversation it belonged to, which is what a
-    /// seized device gives up. This bounds media by age instead, on the same
-    /// principle as the courier envelope and gossip archive lifetimes.
-    ///
-    /// Honors the same exclusions as quota eviction: in-flight live captures
-    /// and files reserved by an in-progress delivery or deletion are left
-    /// alone regardless of age.
+    /// outgoing directories, skipping in-flight live captures.
     @discardableResult
     func expireAgedMedia(retention: TimeInterval = Self.defaultMediaRetention) -> Int {
         guard retention > 0 else { return 0 }
 
-        payloadCoordination.lock.lock()
-        defer { payloadCoordination.lock.unlock() }
-
         let cutoff = dateProvider().addingTimeInterval(-retention)
-        let activeDeletionPaths = payloadCoordination
-            .deletionReservations.values.reduce(into: Set<String>()) {
-                $0.formUnion($1)
-            }
-        let protectedPaths = activeDeletionPaths.union(
-            payloadCoordination.pendingDeliveryPaths
-        )
-
+        let protectedPaths = directoryCache.pendingDeliveryPathsSnapshot()
         var removed = 0
         do {
             let base = try filesDirectory()
             for subdirectory in Self.mediaSubdirectories {
                 let dir = base.appendingPathComponent(subdirectory, isDirectory: true)
-                guard fileManager.fileExists(atPath: dir.path) else { continue }
-                guard let contents = try? fileManager.contentsOfDirectory(
-                    at: dir,
-                    includingPropertiesForKeys: [.contentModificationDateKey],
-                    options: [.skipsHiddenFiles]
-                ) else { continue }
+                guard fileManager.fileExists(atPath: dir.path),
+                      let contents = try? fileManager.contentsOfDirectory(
+                          at: dir,
+                          includingPropertiesForKeys: [.contentModificationDateKey],
+                          options: [.skipsHiddenFiles]
+                      ) else { continue }
 
                 for fileURL in contents {
                     guard let modified = try? fileURL.resourceValues(
                         forKeys: [.contentModificationDateKey]
-                    ).contentModificationDate else { continue }
-                    guard modified < cutoff else { continue }
-                    guard !fileURL.lastPathComponent.hasPrefix(Self.liveCapturePrefix) else { continue }
-                    guard !protectedPaths.contains(
-                        fileURL.standardizedFileURL.path
-                    ) else { continue }
+                    ).contentModificationDate,
+                          modified < cutoff,
+                          !fileURL.lastPathComponent.hasPrefix(Self.liveCapturePrefix),
+                          !protectedPaths.contains(fileURL.standardizedFileURL.path) else {
+                        continue
+                    }
 
                     do {
                         try fileManager.removeItem(at: fileURL)
@@ -652,10 +500,7 @@ struct BLEIncomingFileStore: @unchecked Sendable {
                 }
             }
         } catch {
-            SecureLogger.warning(
-                "⚠️ Could not expire aged media: \(error)",
-                category: .security
-            )
+            SecureLogger.warning("⚠️ Could not expire aged media: \(error)", category: .security)
             return removed
         }
 
@@ -668,17 +513,8 @@ struct BLEIncomingFileStore: @unchecked Sendable {
         return removed
     }
 
-    /// Stamps the media directories and any resident payloads with the
-    /// explicit protection class, covering files written by builds that
-    /// relied on the container default. Runs every launch: re-stamping an
-    /// equal class is a metadata no-op, and anything carrying a stronger
-    /// class is left alone, so repetition is cheap and can never downgrade.
-    /// In-flight live captures are skipped for symmetry with the retention
-    /// sweep; they receive the class at creation and need no repair.
-    /// Best-effort like the sweep it runs alongside; a file that cannot be
-    /// stamped is logged, not fatal, and the migration moves on to the next
-    /// item. Returns the number of items stamped so the launch path and
-    /// tests can observe coverage.
+    /// Stamps media directories and resident payloads with the explicit
+    /// protection class, leaving stronger classes untouched.
     @discardableResult
     func migrateFileProtectionIfNeeded() -> Int {
         #if os(iOS)
@@ -706,13 +542,6 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     }
 
     #if os(iOS)
-    /// Applies the class to one item, but only when the item currently sits
-    /// at the container default or weaker. The list names the classes that
-    /// are safe to replace; anything else, including classes added in later
-    /// iOS versions, is left alone. Only regular files are stamped when
-    /// `requireRegularFile` is set (and only real directories otherwise),
-    /// matching the caution the legacy-file removal path applies; symlinks
-    /// and other non-regular files are left untouched.
     private func stampProtectionIfWeaker(
         _ itemURL: URL,
         requireRegularFile: Bool,
@@ -735,24 +564,72 @@ struct BLEIncomingFileStore: @unchecked Sendable {
             try fileManager.setAttributes(attributes, ofItemAtPath: itemURL.path)
             return 1
         } catch let error as CocoaError where error.code == .fileNoSuchFile {
-            // Quota eviction or a deletion commit on another store instance
-            // can delete an item out from under this migration; that is not
-            // a failure.
             return 0
         } catch {
-            SecureLogger.warning(
-                "⚠️ Failed to migrate media file protection: \(error)",
-                category: .security
-            )
+            SecureLogger.warning("⚠️ Failed to migrate media file protection: \(error)", category: .security)
             return 0
         }
     }
     #endif
 
-    private func filesDirectory() throws -> URL {
+    // MARK: - Helpers
+
+    private func incomingPayloadURL(relativePath: String) -> URL? {
+        guard !relativePath.isEmpty,
+              let resolved = try? resolvedFilesRootAndIncomingPaths() else {
+            return nil
+        }
+        let candidate = resolved.filesRoot
+            .appendingPathComponent(relativePath, isDirectory: false)
+            .standardizedFileURL
+        let parentPath = candidate.deletingLastPathComponent().path
+        guard resolved.incomingPaths.contains(parentPath) else {
+            return nil
+        }
+        return candidate
+    }
+
+    private func resolvedFilesRootAndIncomingPaths() throws -> (filesRoot: URL, incomingPaths: Set<String>) {
+        directoryCache.lock.lock()
+        if let cachedRoot = directoryCache.filesRoot {
+            let paths = directoryCache.incomingDirectoryPaths
+            directoryCache.lock.unlock()
+            return (cachedRoot, paths)
+        }
+        directoryCache.lock.unlock()
+
         let filesDir = try rootDirectory().appendingPathComponent("files", isDirectory: true)
         try fileManager.createDirectory(at: filesDir, withIntermediateDirectories: true, attributes: Self.mediaProtectionAttributes)
-        return filesDir
+        let standardized = filesDir.standardizedFileURL
+        let incomingPaths = Set(Self.incomingSubdirectories.map {
+            standardized.appendingPathComponent($0, isDirectory: true).standardizedFileURL.path
+        })
+
+        directoryCache.lock.lock()
+        directoryCache.filesRoot = standardized
+        directoryCache.incomingDirectoryPaths = incomingPaths
+        directoryCache.lock.unlock()
+        return (standardized, incomingPaths)
+    }
+
+    private func ensureSubdirectory(_ subdirectory: String) throws -> URL {
+        let filesDir = try filesDirectory()
+        let directory = filesDir.appendingPathComponent(subdirectory, isDirectory: true)
+        directoryCache.lock.lock()
+        let alreadyCreated = directoryCache.createdSubdirectories.contains(subdirectory)
+        directoryCache.lock.unlock()
+        if alreadyCreated && fileManager.fileExists(atPath: directory.path) {
+            return directory
+        }
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: Self.mediaProtectionAttributes)
+        directoryCache.lock.lock()
+        directoryCache.createdSubdirectories.insert(subdirectory)
+        directoryCache.lock.unlock()
+        return directory
+    }
+
+    private func filesDirectory() throws -> URL {
+        try resolvedFilesRootAndIncomingPaths().filesRoot
     }
 
     private func rootDirectory() throws -> URL {
@@ -765,23 +642,14 @@ struct BLEIncomingFileStore: @unchecked Sendable {
     }
 
     private func panicRecoveryPendingMarkerURL() throws -> URL {
-        try rootDirectory().appendingPathComponent(
-            Self.panicRecoveryPendingMarkerFileName,
-            isDirectory: false
-        )
+        try rootDirectory().appendingPathComponent(Self.panicRecoveryPendingMarkerFileName, isDirectory: false)
     }
 
     private func panicRecoveryMarkerURLs() throws -> [URL] {
         let root = try rootDirectory()
         return [
-            root.appendingPathComponent(
-                Self.panicRecoveryPendingMarkerFileName,
-                isDirectory: false
-            ),
-            root.appendingPathComponent(
-                Self.legacyPanicRecoveryPendingMarkerFileName,
-                isDirectory: false
-            )
+            root.appendingPathComponent(Self.panicRecoveryPendingMarkerFileName, isDirectory: false),
+            root.appendingPathComponent(Self.legacyPanicRecoveryPendingMarkerFileName, isDirectory: false)
         ]
     }
 
@@ -799,17 +667,18 @@ struct BLEIncomingFileStore: @unchecked Sendable {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "\\", with: "_")
 
-        let invalid = CharacterSet(charactersIn: "<>:\"|?*\0").union(.controlCharacters)
-        candidate = candidate.components(separatedBy: invalid).joined(separator: "_").trimmed
+        candidate = candidate.components(separatedBy: Self.invalidFilenameCharacters).joined(separator: "_").trimmed
         if candidate.isEmpty { candidate = defaultName }
         if candidate.hasPrefix(".") { candidate = "_" + candidate }
 
-        if candidate.count > 120 {
+        // Reserve room for the 37-character "<uuid>_" prefix within a 120-char cap.
+        let maxSanitizedLength = 80
+        if candidate.count > maxSanitizedLength {
             let ext = (candidate as NSString).pathExtension
             let base = (candidate as NSString).deletingPathExtension
             candidate = ext.isEmpty
-                ? String(candidate.prefix(120))
-                : String(base.prefix(max(10, 120 - ext.count - 1))) + "." + ext
+                ? String(candidate.prefix(maxSanitizedLength))
+                : String(base.prefix(max(10, maxSanitizedLength - ext.count - 1))) + "." + ext
         }
 
         if let fallbackExtension, (candidate as NSString).pathExtension.isEmpty {
@@ -819,58 +688,20 @@ struct BLEIncomingFileStore: @unchecked Sendable {
         return candidate.isEmpty ? defaultName : candidate
     }
 
-    private func uniqueFileURL(
-        in directory: URL,
-        fileName: String,
-        reservedPaths: Set<String>,
-        forceRandomizedName: Bool
-    ) -> URL {
+    private func uniqueFileURL(in directory: URL, sanitizedName: String) -> URL {
         let directoryPath = directory.standardizedFileURL.path
-        func isInsideDirectory(_ url: URL) -> Bool {
-            url.standardizedFileURL.path.hasPrefix(directoryPath + "/")
+        let uniqueName = "\(UUID().uuidString)_\(sanitizedName)"
+        let candidate = directory.appendingPathComponent(uniqueName, isDirectory: false)
+        guard candidate.standardizedFileURL.path.hasPrefix(directoryPath + "/") else {
+            SecureLogger.warning("⚠️ Path traversal blocked: \(sanitizedName)", category: .security)
+            return directory.appendingPathComponent("blocked_\(UUID().uuidString)", isDirectory: false)
         }
-        func isAvailable(_ url: URL) -> Bool {
-            !reservedPaths.contains(url.standardizedFileURL.path)
-                && !fileManager.fileExists(atPath: url.path)
-        }
-
-        var candidate = directory.appendingPathComponent(fileName)
-        guard isInsideDirectory(candidate) else {
-            SecureLogger.warning("⚠️ Path traversal blocked: \(fileName)", category: .security)
-            return directory.appendingPathComponent("blocked_\(UUID().uuidString)")
-        }
-
-        let baseName = (fileName as NSString).deletingPathExtension
-        let ext = (fileName as NSString).pathExtension
-        if forceRandomizedName {
-            let suffix = UUID().uuidString
-            let randomizedName = ext.isEmpty
-                ? "\(baseName)_\(suffix)"
-                : "\(baseName)_\(suffix).\(ext)"
-            return directory.appendingPathComponent(randomizedName)
-        }
-
-        if isAvailable(candidate) {
-            return candidate
-        }
-
-        for counter in 1..<100 {
-            let newName = ext.isEmpty ? "\(baseName) (\(counter))" : "\(baseName) (\(counter)).\(ext)"
-            candidate = directory.appendingPathComponent(newName)
-            guard isInsideDirectory(candidate) else {
-                return directory.appendingPathComponent("blocked_\(UUID().uuidString)")
-            }
-            if isAvailable(candidate) {
-                return candidate
-            }
-        }
-
-        return directory.appendingPathComponent("\(baseName)_\(UUID().uuidString).\(ext.isEmpty ? "dat" : ext)")
+        return candidate
     }
 
     private static func timestampString(from date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
-        return formatter.string(from: date)
+        timestampFormatterLock.lock()
+        defer { timestampFormatterLock.unlock() }
+        return timestampFormatter.string(from: date)
     }
 }

@@ -19,7 +19,6 @@ struct NostrProtocol {
 
     /// Nostr event kinds
     enum EventKind: Int {
-        case metadata = 0
         case textNote = 1
         // BitChat's proprietary private-envelope layers. These reuse the
         // NIP-17/NIP-59 kind numbers (14/13/1059) for historical reasons, but
@@ -97,7 +96,8 @@ struct NostrProtocol {
     /// Returns the content, sender pubkey, and the actual message timestamp (not the randomized outer timestamp)
     static func decryptPrivateMessage(
         giftWrap: NostrEvent,
-        recipientIdentity: NostrIdentity
+        recipientIdentity: NostrIdentity,
+        outerSignatureAlreadyVerified: Bool = false
     ) throws -> (content: String, senderPubkey: String, timestamp: Int) {
 
         // 0. Validate the untrusted outer envelope before any decryption work.
@@ -110,17 +110,19 @@ struct NostrProtocol {
         }
         guard giftWrap.kind == EventKind.giftWrap.rawValue,
               giftWrap.tags == [["p", recipientIdentity.publicKeyHex]],
-              giftWrap.isValidSignature() else {
+              (outerSignatureAlreadyVerified || giftWrap.isValidSignature()) else {
             SecureLogger.error("❌ Rejecting DM: malformed or misbound outer envelope", category: .session)
             throw NostrError.invalidEvent
         }
+
+        let recipientKey = try recipientIdentity.schnorrSigningKey()
 
         // 1. Unwrap the gift wrap
         let seal: NostrEvent
         do {
             seal = try unwrapGiftWrap(
                 giftWrap: giftWrap,
-                recipientKey: recipientIdentity.schnorrSigningKey()
+                recipientKey: recipientKey
             )
             // Successfully unwrapped gift wrap
         } catch {
@@ -144,7 +146,7 @@ struct NostrProtocol {
         do {
             rumor = try openSeal(
                 seal: seal,
-                recipientKey: recipientIdentity.schnorrSigningKey()
+                recipientKey: recipientKey
             )
             // Successfully opened seal
         } catch {
@@ -241,7 +243,8 @@ struct NostrProtocol {
     }
     #endif
 
-    /// Create a geohash-scoped ephemeral public message (kind 20000)
+    #if DEBUG
+    /// Create a geohash-scoped ephemeral public message (kind 20000) without PoW mining (test fixture helper).
     static func createEphemeralGeohashEvent(
         content: String,
         geohash: String,
@@ -259,6 +262,7 @@ struct NostrProtocol {
         let schnorrKey = try senderIdentity.schnorrSigningKey()
         return try event.sign(with: schnorrKey)
     }
+    #endif
 
     /// Create a kind-20000 geohash message carrying a NIP-13 proof-of-work
     /// nonce tag (see `NostrPoW`). Mining runs off the calling actor and is
@@ -619,7 +623,7 @@ struct NostrProtocol {
         let sealed = try XChaCha20Poly1305Compat.seal(plaintext: pt, key: key, nonce24: nonce24)
         
         // v2: base64url(nonce24 || ciphertext || tag)
-        var combined = Data()
+        var combined = Data(capacity: 24 + sealed.ciphertext.count + sealed.tag.count)
         combined.append(nonce24)
         combined.append(sealed.ciphertext)
         combined.append(sealed.tag)
@@ -746,24 +750,11 @@ struct NostrProtocol {
     }
     
     private static func randomizedTimestamp() -> Date {
-        // Add random offset to current time for privacy
+        // Add random offset to current time for privacy.
         // This prevents timing correlation attacks while the actual message timestamp
-        // is preserved in the encrypted rumor
+        // is preserved in the encrypted rumor.
         let offset = TimeInterval.random(in: -900...900) // +/- 15 minutes
-        let now = Date()
-        let randomized = now.addingTimeInterval(offset)
-        
-        // Log with explicit UTC and local time for debugging
-        let formatter = DateFormatter()
-        //
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        formatter.timeZone = TimeZone(abbreviation: "UTC")
-        
-        formatter.timeZone = TimeZone.current
-        
-        // Timestamp randomized for privacy
-        
-        return randomized
+        return Date().addingTimeInterval(offset)
     }
 }
 
@@ -883,13 +874,17 @@ struct NostrEvent: Codable {
         ] as [Any]
         
         let data = try JSONSerialization.data(withJSONObject: serialized, options: [.withoutEscapingSlashes])
-        return (data.sha256Fingerprint(), data.sha256Hash())
+        return data.sha256FingerprintAndHash()
     }
     
-    func jsonString() throws -> String {
+    private static let unescapedJSONEncoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
-        let data = try encoder.encode(self)
+        return encoder
+    }()
+
+    func jsonString() throws -> String {
+        let data = try Self.unescapedJSONEncoder.encode(self)
         return String(data: data, encoding: .utf8) ?? ""
     }
 }

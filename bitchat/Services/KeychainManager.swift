@@ -74,8 +74,10 @@ final class KeychainManager: KeychainManagerProtocol {
         #if DEBUG
         if TestEnvironment.isRunningTests { return sharedTestKeychain }
         #endif
-        return KeychainManager()
+        return shared
     }
+
+    private static let shared = KeychainManager()
 
     #if DEBUG
     /// One store per process, mirroring the real keychain: separate
@@ -91,7 +93,39 @@ final class KeychainManager: KeychainManagerProtocol {
     private let appGroup = "group.\(BitchatApp.bundleID)"
     #if os(iOS)
     private let installAccessGate = KeychainInstallAccessGate()
+    /// Caches whether the app has a keychain-access-group entitlement matching
+    /// `appGroup`. Once a SecItem call returns -34018 (errSecMissingEntitlement),
+    /// subsequent reads/writes/deletes skip the doomed access-group XPC roundtrip.
+    private let accessGroupLock = NSLock()
+    private var accessGroupAvailable = true
+
+    private func shouldUseAccessGroup() -> Bool {
+        accessGroupLock.lock()
+        defer { accessGroupLock.unlock() }
+        return accessGroupAvailable
+    }
+
+    private func markAccessGroupUnavailable() {
+        accessGroupLock.lock()
+        accessGroupAvailable = false
+        accessGroupLock.unlock()
+    }
     #endif
+
+    private func performSecItemWithAccessGroupFallback(_ body: (_ addAccessGroup: Bool) -> OSStatus) -> OSStatus {
+        #if os(iOS)
+        if shouldUseAccessGroup() {
+            let status = body(true)
+            if status != -34018 {
+                return status
+            }
+            markAccessGroupUnavailable()
+        }
+        return body(false)
+        #else
+        return body(false)
+        #endif
+    }
     /// Every generic-password service owned by this app, including names used
     /// by older releases. Keep custom services here so one-time security
     /// migrations and panic deletion cannot silently miss them.
@@ -403,38 +437,67 @@ final class KeychainManager: KeychainManagerProtocol {
         return saveDataWithResult(keyData, forKey: fullKey)
     }
 
-    /// Internal method to save data with detailed result and retry for transient errors
-    private func saveDataWithResult(_ data: Data, forKey key: String, retryCount: Int = 2) -> KeychainSaveResult {
-        // Delete any existing item first to ensure clean state
-        _ = delete(forKey: key)
+    private func upsertItem(
+        matchQuery: [String: Any],
+        attributesToUpdate: [String: Any],
+        addAttributes: [String: Any],
+        useAccessGroupFallback: Bool
+    ) -> OSStatus {
+        func run(_ op: (Bool) -> OSStatus) -> OSStatus {
+            useAccessGroupFallback ? performSecItemWithAccessGroupFallback(op) : op(false)
+        }
+        func update(addAccessGroup: Bool) -> OSStatus {
+            var q = matchQuery
+            if addAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
+            return SecItemUpdate(q as CFDictionary, attributesToUpdate as CFDictionary)
+        }
+        func add(addAccessGroup: Bool) -> OSStatus {
+            var q = addAttributes
+            if addAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
+            return SecItemAdd(q as CFDictionary, nil)
+        }
 
-        // Build base query
-        var base: [String: Any] = [
+        // Prefer atomic SecItemUpdate (1 XPC) over delete+add (2-4 XPCs), falling
+        // back to SecItemAdd only when the item does not yet exist.
+        var status = run(update(addAccessGroup:))
+        if status == errSecItemNotFound {
+            status = run(add(addAccessGroup:))
+            if status == errSecDuplicateItem {
+                status = run(update(addAccessGroup:))
+            }
+        }
+        return status
+    }
+
+    private func upsertDefaultServiceItem(_ data: Data, forKey key: String) -> OSStatus {
+        let matchBase: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
+            kSecAttrService as String: service
+        ]
+        let attributesToUpdate: [String: Any] = [
             kSecValueData as String: data,
-            kSecAttrService as String: service,
             kSecAttrAccessible as String: Self.itemAccessibility,
             kSecAttrLabel as String: "bitchat-\(key)"
         ]
+        var addBase = matchBase
+        addBase[kSecValueData as String] = data
+        addBase[kSecAttrAccessible as String] = Self.itemAccessibility
+        addBase[kSecAttrLabel as String] = "bitchat-\(key)"
         #if os(macOS)
-        base[kSecAttrSynchronizable as String] = false
+        addBase[kSecAttrSynchronizable as String] = false
         #endif
+        return upsertItem(
+            matchQuery: matchBase,
+            attributesToUpdate: attributesToUpdate,
+            addAttributes: addBase,
+            useAccessGroupFallback: true
+        )
+    }
 
-        func attempt(addAccessGroup: Bool) -> OSStatus {
-            var query = base
-            if addAccessGroup { query[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemAdd(query as CFDictionary, nil)
-        }
-
-        #if os(iOS)
-        var status = attempt(addAccessGroup: true)
-        if status == -34018 { // Missing entitlement, retry without access group
-            status = attempt(addAccessGroup: false)
-        }
-        #else
-        let status = attempt(addAccessGroup: false)
-        #endif
+    /// Internal method to save data with detailed result and retry for transient errors
+    private func saveDataWithResult(_ data: Data, forKey key: String, retryCount: Int = 2) -> KeychainSaveResult {
+        let status = upsertDefaultServiceItem(data, forKey: key)
 
         // Classify the result
         let result = classifySaveStatus(status)
@@ -480,18 +543,11 @@ final class KeychainManager: KeychainManagerProtocol {
         ]
 
         var result: AnyObject?
-        func attempt(withAccessGroup: Bool) -> OSStatus {
+        let status = performSecItemWithAccessGroupFallback { withAccessGroup in
             var q = base
             if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
             return SecItemCopyMatching(q as CFDictionary, &result)
         }
-
-        #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
-        #else
-        let status = attempt(withAccessGroup: false)
-        #endif
 
         // Classify the result
         let readResult = classifyReadStatus(status, data: result as? Data)
@@ -565,43 +621,9 @@ final class KeychainManager: KeychainManagerProtocol {
     // MARK: - Generic Operations
     
     private func saveData(_ data: Data, forKey key: String) -> Bool {
-        // Delete any existing item first to ensure clean state
-        _ = delete(forKey: key)
-        
-        // Build base query
-        var base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key,
-            kSecValueData as String: data,
-            kSecAttrService as String: service,
-            kSecAttrAccessible as String: Self.itemAccessibility,
-            kSecAttrLabel as String: "bitchat-\(key)"
-        ]
-        #if os(macOS)
-        base[kSecAttrSynchronizable as String] = false
-        #endif
-
-        // Try with access group where it is expected to work (iOS app builds)
-        var triedWithoutGroup = false
-        func attempt(addAccessGroup: Bool) -> OSStatus {
-            var query = base
-            if addAccessGroup { query[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemAdd(query as CFDictionary, nil)
-        }
-
-        #if os(iOS)
-        var status = attempt(addAccessGroup: true)
-        if status == -34018 { // Missing entitlement, retry without access group
-            triedWithoutGroup = true
-            status = attempt(addAccessGroup: false)
-        }
-        #else
-        // On macOS dev/simulator default to no access group to avoid -34018
-        let status = attempt(addAccessGroup: false)
-        #endif
-
+        let status = upsertDefaultServiceItem(data, forKey: key)
         if status == errSecSuccess { return true }
-        if status == -34018 && !triedWithoutGroup {
+        if status == -34018 {
             SecureLogger.error(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: .keychain)
         } else if status != errSecDuplicateItem {
             SecureLogger.error(NSError(domain: "Keychain", code: Int(status)), context: "Error saving to keychain", category: .keychain)
@@ -610,34 +632,10 @@ final class KeychainManager: KeychainManagerProtocol {
     }
     
     private func retrieveData(forKey key: String) -> Data? {
-        // Base query
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        var result: AnyObject?
-        func attempt(withAccessGroup: Bool) -> OSStatus {
-            var q = base
-            if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemCopyMatching(q as CFDictionary, &result)
+        guard case .success(let data) = retrieveDataWithResult(forKey: key) else {
+            return nil
         }
-
-        #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
-        #else
-        let status = attempt(withAccessGroup: false)
-        #endif
-
-        if status == errSecSuccess { return result as? Data }
-        if status == -34018 {
-            SecureLogger.error(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: .keychain)
-        }
-        return nil
+        return data
     }
     
     private func delete(forKey key: String) -> Bool {
@@ -648,18 +646,11 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecAttrService as String: service
         ]
 
-        func attempt(withAccessGroup: Bool) -> OSStatus {
+        let status = performSecItemWithAccessGroupFallback { withAccessGroup in
             var q = base
             if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
             return SecItemDelete(q as CFDictionary)
         }
-
-        #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
-        #else
-        let status = attempt(withAccessGroup: false)
-        #endif
         return status == errSecSuccess || status == errSecItemNotFound
     }
     
@@ -840,15 +831,6 @@ final class KeychainManager: KeychainManagerProtocol {
         data = Data() // Clear the data object
     }
     
-    /// Securely clear sensitive string from memory
-    func secureClear(_ string: inout String) {
-        // Convert to mutable data and clear
-        if var data = string.data(using: .utf8) {
-            secureClear(&data)
-        }
-        string = "" // Clear the string object
-    }
-    
     // MARK: - Debug
 
     func verifyIdentityKeyExists() -> Bool {
@@ -862,35 +844,30 @@ final class KeychainManager: KeychainManagerProtocol {
     /// Save data with a custom service name
     func save(key: String, data: Data, service customService: String, accessible: CFString?) {
         guard installAccessAllowed() else { return }
+        let accessibility = accessible ?? Self.itemAccessibility
         let primaryKeyQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: customService,
             kSecAttrAccount as String: key
         ]
-        var addQuery = primaryKeyQuery
-        addQuery.merge([
+        let attributesToUpdate: [String: Any] = [
             kSecValueData as String: data,
-            kSecAttrAccessible as String: accessible ?? Self.itemAccessibility,
-            kSecAttrSynchronizable as String: false
-        ]) { _, new in new }
+            kSecAttrAccessible as String: accessibility
+        ]
+        var addQuery = primaryKeyQuery
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = accessibility
+        addQuery[kSecAttrSynchronizable as String] = false
 
-        // Delete by the item's primary key only. Value/accessibility fields
-        // are add attributes, not valid selectors for replacing an existing
-        // item; including them can leave the old item in place and make the
-        // subsequent add fail as a duplicate.
-        let deleteStatus = SecItemDelete(primaryKeyQuery as CFDictionary)
-        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+        let status = upsertItem(
+            matchQuery: primaryKeyQuery,
+            attributesToUpdate: attributesToUpdate,
+            addAttributes: addQuery,
+            useAccessGroupFallback: false
+        )
+        if status != errSecSuccess {
             SecureLogger.error(
-                NSError(domain: "Keychain", code: Int(deleteStatus)),
-                context: "Unable to replace custom-service keychain item",
-                category: .keychain
-            )
-            return
-        }
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        if addStatus != errSecSuccess {
-            SecureLogger.error(
-                NSError(domain: "Keychain", code: Int(addStatus)),
+                NSError(domain: "Keychain", code: Int(status)),
                 context: "Unable to save custom-service keychain item",
                 category: .keychain
             )
@@ -938,25 +915,8 @@ final class KeychainManager: KeychainManagerProtocol {
         guard installAccessAllowed() else { return }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: customService,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-            kSecReturnAttributes as String: true
+            kSecAttrService as String: customService
         ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
-            return
-        }
-        for item in items {
-            var deleteQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: customService
-            ]
-            if let account = item[kSecAttrAccount as String] as? String {
-                deleteQuery[kSecAttrAccount as String] = account
-            }
-            SecItemDelete(deleteQuery as CFDictionary)
-        }
+        SecItemDelete(query as CFDictionary)
     }
 }

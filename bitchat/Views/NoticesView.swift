@@ -27,6 +27,7 @@ struct NoticesView: View {
     @ThemedPalette private var palette
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var locationChannelsModel: LocationChannelsModel
     @State private var tab: Tab
     @State private var draft: String = ""
@@ -125,13 +126,14 @@ struct NoticesView: View {
         geohash: String?,
         manager: LocationNotesManager?,
         ownsLiveRefresh: Bool,
+        isAppActive: Bool = true,
         beginLiveRefresh: () -> Void,
         endLiveRefresh: () -> Void,
         acquire: (String) -> LocationNotesManager,
         release: (LocationNotesManager?) -> Void
     ) -> GeoSessionState {
         let geoTabActive = tab == .geo && notesEnabled
-        let wantsLiveRefresh = geoTabActive && needsDeviceLocation && permissionState == .authorized
+        let wantsLiveRefresh = geoTabActive && needsDeviceLocation && permissionState == .authorized && isAppActive
 
         if wantsLiveRefresh != ownsLiveRefresh {
             if wantsLiveRefresh {
@@ -184,6 +186,7 @@ struct NoticesView: View {
             geohash: geoGeohash,
             manager: liveGeoManager,
             ownsLiveRefresh: ownsLiveGeoRefresh,
+            isAppActive: scenePhase == .active,
             beginLiveRefresh: {
                 locationChannelsModel.enableLocationChannels()
                 locationChannelsModel.beginLiveRefresh()
@@ -272,13 +275,17 @@ struct NoticesView: View {
             )
         }
 
+        static let relativeFormatter: RelativeDateTimeFormatter = {
+            let f = RelativeDateTimeFormatter()
+            f.unitsStyle = .abbreviated
+            return f
+        }()
+
         static func fades(_ expiresAt: Date) -> String {
-            let formatter = RelativeDateTimeFormatter()
-            formatter.unitsStyle = .abbreviated
-            return String(
+            String(
                 format: String(localized: "notices.fades", defaultValue: "fades %@", comment: "Shown on notices with an expiry; placeholder is a localized relative time like 'in 23h'"),
                 locale: .current,
-                formatter.localizedString(for: expiresAt, relativeTo: Date())
+                relativeFormatter.localizedString(for: expiresAt, relativeTo: Date())
             )
         }
 
@@ -329,6 +336,9 @@ struct NoticesView: View {
             reconcileGeoSession()
         }
         .onChange(of: geoTabNeedsDeviceLocation) { _ in
+            reconcileGeoSession()
+        }
+        .onChange(of: scenePhase) { _ in
             reconcileGeoSession()
         }
         .onReceive(NotificationCenter.default.publisher(for: LocationNotesSettings.didChangeNotification)) { _ in
@@ -802,17 +812,11 @@ private struct NoticesList: View {
             // The whole "3 hr ago" phrase must come from the formatter —
             // gluing an English "ago" onto a localized duration ships the
             // wrong word order to most locales ("hace 3 h", "vor 3 Std").
-            return relativeFormatter.localizedString(for: date, relativeTo: now)
+            return NoticesView.Strings.relativeFormatter.localizedString(for: date, relativeTo: now)
         }
         let sameYear = Calendar.current.isDate(date, equalTo: now, toGranularity: .year)
         return (sameYear ? absDateFormatter : absDateYearFormatter).string(from: date)
     }
-
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
-    }()
 
     private static let absDateFormatter: DateFormatter = {
         let f = DateFormatter()

@@ -157,6 +157,7 @@ extension BLEService: CBCentralManagerDelegate {
 
         // Update state to connected
         linkStateStore.markConnected(peripheral)
+        wakeMaintenanceCadenceIfNeeded()
         
         // Reset backoff state on success
         radio.recordConnectionSuccess(peripheralID: peripheralID)
@@ -272,16 +273,7 @@ extension BLEService: CBPeripheralDelegate {
         }
         
         // Found characteristic
-        
-        // Log characteristic properties for debugging
-        var properties: [String] = []
-        if characteristic.properties.contains(.read) { properties.append("read") }
-        if characteristic.properties.contains(.write) { properties.append("write") }
-        if characteristic.properties.contains(.writeWithoutResponse) { properties.append("writeWithoutResponse") }
-        if characteristic.properties.contains(.notify) { properties.append("notify") }
-        if characteristic.properties.contains(.indicate) { properties.append("indicate") }
-        // Characteristic properties: \(properties.joined(separator: ", "))
-        
+
         // Verify characteristic supports reliable writes
         if !characteristic.properties.contains(.write) {
             SecureLogger.warning("⚠️ Characteristic doesn't support reliable writes (withResponse)!", category: .session)

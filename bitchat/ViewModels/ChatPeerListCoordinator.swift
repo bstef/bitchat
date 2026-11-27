@@ -12,7 +12,6 @@ import Foundation
 @MainActor
 protocol ChatPeerListContext: AnyObject {
     // MARK: Connection & chat state
-    var isConnected: Bool { get set }
     /// A single private chat's timeline (store-direct lookup on
     /// `ChatViewModel`; no `privateChats` dictionary build).
     func privateMessages(for peerID: PeerID) -> [BitchatMessage]
@@ -30,7 +29,6 @@ protocol ChatPeerListContext: AnyObject {
     /// Number of mesh peers currently connected or reachable, from the
     /// transport's live peer snapshots.
     func activeMeshPeerCount() -> Int
-    func registerEphemeralSession(peerID: PeerID)
     func updateEncryptionStatusForPeers()
 
     // MARK: Notifications
@@ -65,9 +63,7 @@ extension ChatViewModel: ChatPeerListContext {
     }
 
     func recordMeshSightings(peerIDs: [PeerID]) {
-        for peerID in peerIDs {
-            MeshSightingsTracker.shared.recordSighting(peerID: peerID)
-        }
+        MeshSightingsTracker.shared.recordSightings(peerIDs)
     }
 }
 
@@ -113,7 +109,6 @@ final class ChatPeerListCoordinator: @unchecked Sendable {
 private extension ChatPeerListCoordinator {
     @MainActor
     func handlePeerListUpdate(_ peers: [PeerID]) {
-        context.isConnected = !peers.isEmpty
         cleanupStaleUnreadPeerIDs()
 
         let meshPeers = peers.filter { peerID in
@@ -121,10 +116,6 @@ private extension ChatPeerListCoordinator {
         }
 
         handleNetworkAvailability(meshPeers)
-
-        for peerID in peers {
-            context.registerEphemeralSession(peerID: peerID)
-        }
 
         context.updateEncryptionStatusForPeers()
 
@@ -202,46 +193,54 @@ private extension ChatPeerListCoordinator {
     }
 
     @MainActor
-    func scheduleNetworkResetTimer() {
-        networkResetTimer?.invalidate()
-        networkResetTimer = Timer.scheduledTimer(withTimeInterval: networkResetGraceSeconds, repeats: false) { [weak self] _ in
+    func scheduleOneShotTimer(
+        interval: TimeInterval,
+        handler: @escaping @MainActor (ChatPeerListCoordinator) -> Void
+    ) -> Timer {
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { [weak self] in
-                self?.handleNetworkResetTimerFired()
+                guard let self else { return }
+                handler(self)
             }
+        }
+        timer.tolerance = min(2.0, interval * 0.1)
+        return timer
+    }
+
+    @MainActor
+    func resetNotificationStateIfMeshEmpty(resetLog: String, skipLog: (Int) -> String) {
+        let activeMeshPeerCount = context.activeMeshPeerCount()
+        if activeMeshPeerCount == 0 {
+            recentlySeenPeers.removeAll()
+            meshWasEmpty = true
+            SecureLogger.debug(resetLog, category: .session)
+        } else {
+            SecureLogger.debug(skipLog(activeMeshPeerCount), category: .session)
         }
     }
 
     @MainActor
-    func handleNetworkResetTimerFired() {
-        let activeMeshPeerCount = context.activeMeshPeerCount()
-
-        if activeMeshPeerCount == 0 {
-            recentlySeenPeers.removeAll()
-            meshWasEmpty = true
-            SecureLogger.debug("⏱️ Network notification window reset after quiet period", category: .session)
-        } else {
-            SecureLogger.debug(
-                "⏱️ Skipped network notification reset; still seeing \(activeMeshPeerCount) mesh peers",
-                category: .session
+    func scheduleNetworkResetTimer() {
+        networkResetTimer?.invalidate()
+        networkResetTimer = scheduleOneShotTimer(interval: networkResetGraceSeconds) { coordinator in
+            coordinator.resetNotificationStateIfMeshEmpty(
+                resetLog: "⏱️ Network notification window reset after quiet period",
+                skipLog: { "⏱️ Skipped network notification reset; still seeing \($0) mesh peers" }
             )
+            coordinator.networkResetTimer = nil
         }
-
-        networkResetTimer = nil
     }
 
     @MainActor
     func scheduleNetworkEmptyTimer() {
         guard networkEmptyTimer == nil else { return }
-
-        networkEmptyTimer = Timer.scheduledTimer(
-            withTimeInterval: TransportConfig.uiMeshEmptyConfirmationSeconds,
-            repeats: false
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { [weak self] in
-                self?.handleNetworkEmptyTimerFired()
-            }
+        networkEmptyTimer = scheduleOneShotTimer(interval: TransportConfig.uiMeshEmptyConfirmationSeconds) { coordinator in
+            coordinator.resetNotificationStateIfMeshEmpty(
+                resetLog: "⏳ Mesh empty — notification state reset after confirmation",
+                skipLog: { "⏳ Mesh empty timer cancelled; \($0) mesh peers detected again" }
+            )
+            coordinator.networkEmptyTimer = nil
         }
-
         SecureLogger.debug("⏳ Mesh empty — waiting before resetting notification state", category: .session)
     }
 
@@ -249,24 +248,6 @@ private extension ChatPeerListCoordinator {
     func invalidateNetworkEmptyTimer() {
         guard networkEmptyTimer != nil else { return }
         networkEmptyTimer?.invalidate()
-        networkEmptyTimer = nil
-    }
-
-    @MainActor
-    func handleNetworkEmptyTimerFired() {
-        let activeMeshPeerCount = context.activeMeshPeerCount()
-
-        if activeMeshPeerCount == 0 {
-            recentlySeenPeers.removeAll()
-            meshWasEmpty = true
-            SecureLogger.debug("⏳ Mesh empty — notification state reset after confirmation", category: .session)
-        } else {
-            SecureLogger.debug(
-                "⏳ Mesh empty timer cancelled; \(activeMeshPeerCount) mesh peers detected again",
-                category: .session
-            )
-        }
-
         networkEmptyTimer = nil
     }
 }

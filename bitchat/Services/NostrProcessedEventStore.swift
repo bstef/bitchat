@@ -21,18 +21,59 @@ import Foundation
 /// file must also load during a locked-background restoration relaunch.
 /// Wiped on panic via the dedup service's clear paths.
 final class NostrProcessedEventStore {
-    private let fileURL: URL?
+    private enum LoadResult {
+        case loaded([String])
+        case transientError
+    }
+
+    private let fileStore: AppSupportFileStore
+    private let readData: (URL) throws -> Data
     // All file access is serialized here: appends are read-modify-write, and
     // overlapping debounced flushes would otherwise race and drop IDs.
     private let ioQueue = DispatchQueue(label: "chat.bitchat.nostr-processed-events", qos: .utility)
 
-    init(fileURL: URL? = nil) {
-        self.fileURL = fileURL ?? Self.defaultFileURL()
+    private var cachedIDs: [String]?
+    private var cachedKnown: Set<String> = []
+    private var deferredIDs: [String] = []
+
+    init(
+        fileURL: URL? = nil,
+        readData: @escaping (URL) throws -> Data = { try Data(contentsOf: $0) }
+    ) {
+        self.fileStore = AppSupportFileStore(
+            fileURL: fileURL,
+            subdirectory: "nostr",
+            fileName: "processed-events.json",
+            protection: .untilFirstUserAuthentication
+        )
+        self.readData = readData
     }
 
+    #if DEBUG
     /// Processed event IDs, oldest first (insertion order).
     func load() -> [String] {
-        ioQueue.sync { loadLocked() }
+        ioQueue.sync {
+            switch loadLocked() {
+            case .loaded(let ids):
+                return ids
+            case .transientError:
+                return []
+            }
+        }
+    }
+    #endif
+
+    /// Loads processed event IDs asynchronously on the utility I/O queue so
+    /// cold launch does not block the main actor on disk I/O + JSON decoding.
+    func loadAsync(completion: @escaping @Sendable ([String]) -> Void) {
+        ioQueue.async { [self] in
+            switch loadLocked() {
+            case .loaded(let ids):
+                completion(ids)
+            case .transientError:
+                completion([])
+            }
+        }
     }
 
     /// Merge new IDs onto the persisted record, oldest-first, trimming from
@@ -42,66 +83,83 @@ final class NostrProcessedEventStore {
     func append(_ newIDs: [String], cap: Int) {
         guard !newIDs.isEmpty else { return }
         ioQueue.async { [self] in
-            var merged = loadLocked()
-            var known = Set(merged)
-            for id in newIDs where !known.contains(id) {
-                merged.append(id)
-                known.insert(id)
+            switch loadLocked() {
+            case .transientError:
+                // Never overwrite an unreadable durable file with an empty
+                // baseline; hold new IDs until the file becomes readable.
+                deferredIDs.append(contentsOf: newIDs)
+                if deferredIDs.count > cap {
+                    deferredIDs.removeFirst(deferredIDs.count - cap)
+                }
+            case .loaded(var merged):
+                let pending = deferredIDs + newIDs
+                deferredIDs.removeAll()
+                var didAdd = false
+                for id in pending where cachedKnown.insert(id).inserted {
+                    merged.append(id)
+                    didAdd = true
+                }
+                guard didAdd else { return }
+                if merged.count > cap {
+                    let overflow = merged.count - cap
+                    for evicted in merged.prefix(overflow) {
+                        cachedKnown.remove(evicted)
+                    }
+                    merged.removeFirst(overflow)
+                }
+                cachedIDs = merged
+                saveLocked(merged)
             }
-            if merged.count > cap {
-                merged.removeFirst(merged.count - cap)
-            }
-            saveLocked(merged)
         }
     }
 
     func wipe() {
         ioQueue.sync {
-            guard let fileURL else { return }
-            try? FileManager.default.removeItem(at: fileURL)
+            cachedIDs = []
+            cachedKnown.removeAll()
+            deferredIDs.removeAll()
+            fileStore.removeIgnoringErrors()
         }
     }
 
-    private func loadLocked() -> [String] {
-        guard let fileURL,
-              let data = try? Data(contentsOf: fileURL),
-              let ids = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
+    private func loadLocked() -> LoadResult {
+        if let cachedIDs {
+            return .loaded(cachedIDs)
         }
-        return ids
+        guard let fileURL = fileStore.fileURL,
+              FileManager.default.fileExists(atPath: fileURL.path) else {
+            cachedIDs = []
+            cachedKnown = []
+            return .loaded([])
+        }
+        let data: Data
+        do {
+            data = try readData(fileURL)
+        } catch {
+            if AppSupportFileStore.isMissingFileError(error) {
+                cachedIDs = []
+                cachedKnown = []
+                return .loaded([])
+            }
+            // Leave cache uninitialized so later loads/appends recover the
+            // durable record once file protection or transient I/O clears.
+            return .transientError
+        }
+        guard let ids = try? JSONDecoder().decode([String].self, from: data) else {
+            cachedIDs = []
+            cachedKnown = []
+            return .loaded([])
+        }
+        cachedIDs = ids
+        cachedKnown = Set(ids)
+        return .loaded(ids)
     }
 
     private func saveLocked(_ eventIDs: [String]) {
-        guard let fileURL else { return }
-        guard !eventIDs.isEmpty else {
-            try? FileManager.default.removeItem(at: fileURL)
-            return
-        }
         do {
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let data = try JSONEncoder().encode(eventIDs)
-            var options: Data.WritingOptions = [.atomic]
-            #if os(iOS)
-            options.insert(.completeFileProtectionUntilFirstUserAuthentication)
-            #endif
-            try data.write(to: fileURL, options: options)
+            try fileStore.saveJSON(eventIDs, isEmpty: eventIDs.isEmpty)
         } catch {
             SecureLogger.error("Failed to persist processed Nostr events: \(error)", category: .session)
         }
-    }
-
-    private static func defaultFileURL() -> URL? {
-        guard let base = try? FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        ) else { return nil }
-        return base
-            .appendingPathComponent("nostr", isDirectory: true)
-            .appendingPathComponent("processed-events.json")
     }
 }

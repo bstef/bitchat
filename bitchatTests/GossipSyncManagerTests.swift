@@ -84,10 +84,16 @@ struct GossipSyncManagerTests {
         #expect(manager._hasAnnouncement(for: PeerID(str: peerHex)))
         #expect(manager._messageCount(for: PeerID(str: peerHex)) == 1)
         
-        // Run cleanup past the timeout
+        // Run cleanup past the stale peer timeout: presence expires, but
+        // carried public messages survive until maxMessageAgeSeconds (6h).
         let future = Date().addingTimeInterval(config.stalePeerTimeoutSeconds + 1)
         manager._performMaintenanceSynchronously(now: future)
         #expect(manager._hasAnnouncement(for: PeerID(str: peerHex)) == false)
+        #expect(manager._messageCount(for: PeerID(str: peerHex)) == 1)
+
+        // Explicit LEAVE removal still drops carried messages for the peer.
+        manager.removeAnnouncementForPeer(PeerID(str: peerHex))
+        manager._performMaintenanceSynchronously(now: future)
         #expect(manager._messageCount(for: PeerID(str: peerHex)) == 0)
     }
 
@@ -169,7 +175,8 @@ struct GossipSyncManagerTests {
         manager._performMaintenanceSynchronously()
 
         #expect(manager._hasAnnouncement(for: PeerID(str: peerHex)) == false)
-        #expect(manager._messageCount(for: PeerID(str: peerHex)) == 0)
+        // A stale announce must not wipe fresh public messages within maxMessageAgeSeconds.
+        #expect(manager._messageCount(for: PeerID(str: peerHex)) == 1)
     }
 
     @Test func maintenanceEmitsTypedSyncRequests() throws {
@@ -1101,11 +1108,39 @@ struct GossipSyncManagerTests {
         #expect(erased)
     }
 
+    @Test func periodicSyncSkipsWorkWhenNoSyncTargetsExist() throws {
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, requestSyncManager: requestSyncManager)
+        let delegate = RecordingDelegate()
+        delegate.syncTargetsAvailable = false
+        manager.delegate = delegate
+
+        let senderID = try #require(Data(hexString: "1122334455667788"))
+        manager.onPublicPacketSeen(BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: senderID,
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: Data([0x01, 0x02]),
+            signature: nil,
+            ttl: 1
+        ))
+
+        manager._performMaintenanceSynchronously(now: Date())
+        #expect(delegate.packets.isEmpty)
+
+        // Once a sync target appears, periodic sync resumes sending.
+        delegate.syncTargetsAvailable = true
+        manager._performMaintenanceSynchronously(now: Date())
+        #expect(!delegate.packets.isEmpty)
+    }
+
 }
 
 private final class RecordingDelegate: GossipSyncManager.Delegate {
     var onSend: (() -> Void)?
     var connectedPeers: [PeerID] = []
+    var syncTargetsAvailable = true
     private(set) var lastPacket: BitchatPacket?
     private(set) var packets: [BitchatPacket] = []
     private let lock = NSLock()
@@ -1132,5 +1167,9 @@ private final class RecordingDelegate: GossipSyncManager.Delegate {
     
     func getConnectedPeers() -> [PeerID] {
         return connectedPeers
+    }
+
+    func hasSyncTargets() -> Bool {
+        syncTargetsAvailable
     }
 }

@@ -13,6 +13,7 @@ protocol NostrInboundPipelineContext: AnyObject {
     // MARK: Event dedup
     func hasProcessedNostrEvent(_ eventID: String) -> Bool
     func recordProcessedNostrEvent(_ eventID: String)
+    func recordProcessedEphemeralNostrEvent(_ eventID: String)
 
     // MARK: Nostr identity & blocking
     func deriveNostrIdentity(forGeohash geohash: String) throws -> NostrIdentity
@@ -21,9 +22,9 @@ protocol NostrInboundPipelineContext: AnyObject {
     func displayNameForNostrPubkey(_ pubkeyHex: String) -> String
 
     // MARK: Favorites bridge
-    /// All favorite relationships, used to bridge a Nostr pubkey back to a
-    /// Noise key on the inbound DM path.
-    func allFavoriteRelationships() -> [FavoritesPersistenceService.FavoriteRelationship]
+    /// Fast reverse lookup from a Nostr pubkey (hex or npub) to a favorite's
+    /// Noise static key.
+    func favoriteNoiseKey(forNostrPubkey nostrPubkey: String) -> Data?
 
     // MARK: Presence & key mapping
     func setGeoNickname(_ nickname: String, forPubkey pubkeyHex: String)
@@ -64,12 +65,16 @@ extension ChatViewModel: NostrInboundPipelineContext {
         deduplicationService.hasProcessedNostrEvent(eventID)
     }
 
-    func allFavoriteRelationships() -> [FavoritesPersistenceService.FavoriteRelationship] {
-        Array(FavoritesPersistenceService.shared.favorites.values)
+    func favoriteNoiseKey(forNostrPubkey nostrPubkey: String) -> Data? {
+        FavoritesPersistenceService.shared.noisePublicKey(forNostrPubkey: nostrPubkey)
     }
 
     func recordProcessedNostrEvent(_ eventID: String) {
-        deduplicationService.recordNostrEvent(eventID)
+        deduplicationService.recordNostrEvent(eventID, persist: true)
+    }
+
+    func recordProcessedEphemeralNostrEvent(_ eventID: String) {
+        deduplicationService.recordNostrEvent(eventID, persist: false)
     }
 
     func setGeoNickname(_ nickname: String, forPubkey pubkeyHex: String) {
@@ -126,7 +131,7 @@ final class NostrInboundPipeline {
     /// replayed history doesn't make its authors look present; live events
     /// count when they arrive, which keeps senders with skewed clocks visible.
     @MainActor
-    func subscribeNostrEvent(_ event: NostrEvent, isHistoryReplay: Bool = false) {
+    func handleNostrEvent(_ event: NostrEvent, isHistoryReplay: Bool = false) {
         guard let context else { return }
         // Cheap rejects (kind, dedup lookup) — duplicates dominate real
         // traffic. The signature was already verified (exactly once, off the
@@ -137,93 +142,7 @@ final class NostrInboundPipeline {
         else {
             return
         }
-
-        context.recordProcessedNostrEvent(event.id)
-
-        if let gh = context.currentGeohash,
-           let myGeoIdentity = try? context.deriveNostrIdentity(forGeohash: gh),
-           myGeoIdentity.publicKeyHex.lowercased() == event.pubkey.lowercased() {
-            let eventTime = Date(timeIntervalSince1970: TimeInterval(event.created_at))
-            if Date().timeIntervalSince(eventTime) < 15 {
-                return
-            }
-        }
-
-        if let nickTag = event.tags.first(where: { $0.first == "n" }), nickTag.count >= 2 {
-            let nick = nickTag[1].trimmed
-            context.setGeoNickname(nick, forPubkey: event.pubkey)
-        }
-
-        context.registerNostrKeyMapping(event.pubkey, for: PeerID(nostr_: event.pubkey))
-        context.registerNostrKeyMapping(event.pubkey, for: PeerID(nostr: event.pubkey))
-        let countsAsPresence = context.recordGeoParticipant(
-            pubkeyHex: event.pubkey,
-            seenAt: isHistoryReplay ? Date(timeIntervalSince1970: TimeInterval(event.created_at)) : Date()
-        )
-
-        if event.kind == NostrProtocol.EventKind.geohashPresence.rawValue {
-            return
-        }
-
-        // Teleport markers describe people present now and are pruned only
-        // when the roster changes, so a tag on history too old to count must
-        // not mark its absent author: the marker could still be there when
-        // they came back. A teleported sender tags every message, so their
-        // recent ones still mark them.
-        if countsAsPresence, GeoPresenceTracker.hasTeleportTag(event) {
-            let key = event.pubkey.lowercased()
-            let isSelf: Bool = {
-                if let gh = context.currentGeohash,
-                   let myIdentity = try? context.deriveNostrIdentity(forGeohash: gh) {
-                    return myIdentity.publicKeyHex.lowercased() == key
-                }
-                return false
-            }()
-            if !isSelf {
-                presence.scheduleMarkPeerTeleported(key, logged: false)
-            }
-        }
-
-        let senderName = context.displayNameForNostrPubkey(event.pubkey)
-        let content = event.content.trimmed
-        let rawTs = Date(timeIntervalSince1970: TimeInterval(event.created_at))
-        let timestamp = min(rawTs, Date())
-        let mentions = context.parseMentions(from: content)
-        let powBits = NostrPoW.validatedDifficulty(idHex: event.id, tags: event.tags)
-        let message = BitchatMessage(
-            id: event.id,
-            sender: senderName,
-            content: content,
-            timestamp: timestamp,
-            isRelay: false,
-            senderPeerID: PeerID(nostr: event.pubkey),
-            mentions: mentions.isEmpty ? nil : mentions
-        )
-
-        Task { @MainActor [weak context] in
-            guard let context else { return }
-            let isBlocked = context.isNostrBlocked(pubkeyHexLowercased: event.pubkey.lowercased())
-            context.handlePublicMessage(message, powBits: powBits)
-            if !isBlocked {
-                context.checkForMentions(message)
-                context.sendHapticFeedback(for: message)
-            }
-        }
-    }
-
-    /// See `subscribeNostrEvent(_:isHistoryReplay:)` for `isHistoryReplay`.
-    @MainActor
-    func handleNostrEvent(_ event: NostrEvent, isHistoryReplay: Bool = false) {
-        guard let context else { return }
-        // Cheap rejects (kind, dedup lookup) — the signature was already
-        // verified (exactly once, off the main actor) by NostrRelayManager.
-        guard (event.kind == NostrProtocol.EventKind.ephemeralEvent.rawValue
-            || event.kind == NostrProtocol.EventKind.geohashPresence.rawValue)
-        else {
-            return
-        }
-        if context.hasProcessedNostrEvent(event.id) { return }
-        context.recordProcessedNostrEvent(event.id)
+        context.recordProcessedEphemeralNostrEvent(event.id)
 
         let powBits = NostrPoW.validatedDifficulty(idHex: event.id, tags: event.tags)
 
@@ -236,7 +155,8 @@ final class NostrInboundPipeline {
             )
         }
 
-        if context.isNostrBlocked(pubkeyHexLowercased: event.pubkey) {
+        let lowercasedPubkey = event.pubkey.lowercased()
+        if context.isNostrBlocked(pubkeyHexLowercased: lowercasedPubkey) {
             return
         }
 
@@ -245,7 +165,7 @@ final class NostrInboundPipeline {
         let isSelf: Bool = {
             if let gh = context.currentGeohash,
                let my = try? context.deriveNostrIdentity(forGeohash: gh) {
-                return my.publicKeyHex.lowercased() == event.pubkey.lowercased()
+                return my.publicKeyHex.lowercased() == lowercasedPubkey
             }
             return false
         }()
@@ -267,9 +187,11 @@ final class NostrInboundPipeline {
         context.registerNostrKeyMapping(event.pubkey, for: PeerID(nostr: event.pubkey))
         let countsAsPresence = context.recordGeoParticipant(pubkeyHex: event.pubkey, seenAt: seenAt)
 
-        // Only activity that counts marks teleport; see subscribeNostrEvent.
+        // Teleport markers describe people present now and are pruned only
+        // when the roster changes, so a tag on history too old to count must
+        // not mark its absent author.
         if hasTeleportTag, !isSelf, countsAsPresence {
-            presence.scheduleMarkPeerTeleported(event.pubkey.lowercased(), logged: true)
+            presence.scheduleMarkPeerTeleported(lowercasedPubkey, logged: true)
         }
 
         if event.kind == NostrProtocol.EventKind.geohashPresence.rawValue {
@@ -279,40 +201,33 @@ final class NostrInboundPipeline {
         let senderName = context.displayNameForNostrPubkey(event.pubkey)
         let content = event.content
 
-        if let teleTag = event.tags.first(where: { $0.first == "t" }),
-           teleTag.count >= 2,
-           teleTag[1] == "teleport",
-           content.trimmed.isEmpty {
+        if hasTeleportTag, content.trimmed.isEmpty {
             return
         }
 
-        let rawTs = Date(timeIntervalSince1970: TimeInterval(event.created_at))
         let mentions = context.parseMentions(from: content)
         let message = BitchatMessage(
             id: event.id,
             sender: senderName,
             content: content,
-            timestamp: min(rawTs, Date()),
+            timestamp: min(eventTime, Date()),
             isRelay: false,
             senderPeerID: PeerID(nostr: event.pubkey),
             mentions: mentions.isEmpty ? nil : mentions
         )
 
-        Task { @MainActor [weak context] in
-            guard let context else { return }
-            context.handlePublicMessage(message, powBits: powBits)
-            context.checkForMentions(message)
-            context.sendHapticFeedback(for: message)
-        }
+        context.handlePublicMessage(message, powBits: powBits)
+        context.checkForMentions(message)
+        context.sendHapticFeedback(for: message)
     }
 
     @MainActor
-    func subscribeGiftWrap(_ giftWrap: NostrEvent, id: NostrIdentity) {
+    func handleGiftWrap(
+        _ giftWrap: NostrEvent,
+        id: NostrIdentity,
+        outerSignatureAlreadyVerified: Bool = false
+    ) {
         guard let context else { return }
-        // Cheap dedup pre-check only; processGeohashGiftWrap does the
-        // authoritative main-actor check-and-record before the off-main
-        // NIP-17 unwrap. The outer signature was already verified (exactly
-        // once, off the main actor) by NostrRelayManager.
         guard !context.hasProcessedNostrEvent(giftWrap.id) else { return }
 
         // Capture the wipe generation at spawn, alongside the per-geohash
@@ -321,217 +236,149 @@ final class NostrInboundPipeline {
         // drops its result instead of delivering plaintext post-wipe.
         let wipeGeneration = self.wipeGeneration
         Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.processGeohashGiftWrap(giftWrap, id: id, verbose: false, wipeGeneration: wipeGeneration)
+            await self?.processGiftWrap(
+                giftWrap,
+                geohashIdentity: id,
+                initialWipeGeneration: wipeGeneration,
+                outerSignatureAlreadyVerified: outerSignatureAlreadyVerified
+            )
         }
     }
 
     @MainActor
-    func handleGiftWrap(_ giftWrap: NostrEvent, id: NostrIdentity) {
+    func handleNostrMessage(_ giftWrap: NostrEvent, outerSignatureAlreadyVerified: Bool = false) {
         guard let context else { return }
-        // Cheap dedup pre-check only; see subscribeGiftWrap.
-        if context.hasProcessedNostrEvent(giftWrap.id) {
-            return
-        }
+        // Cheap dedup pre-check only; processNostrMessage does the
+        // authoritative check-and-record before the off-main NIP-17 unwrap.
+        if context.hasProcessedNostrEvent(giftWrap.id) { return }
 
-        // Spawn-time wipe-generation capture; see subscribeGiftWrap.
-        let wipeGeneration = self.wipeGeneration
         Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.processGeohashGiftWrap(giftWrap, id: id, verbose: true, wipeGeneration: wipeGeneration)
+            await self?.processNostrMessage(
+                giftWrap,
+                outerSignatureAlreadyVerified: outerSignatureAlreadyVerified
+            )
         }
     }
 
-    /// Geohash-DM gift wrap ingest. The NIP-17 unwrap (two ECDH+ChaCha
-    /// layers) runs off the main actor; results hop back for state updates.
-    /// `verbose` keeps `handleGiftWrap`'s decrypt logging without adding it
-    /// to the sampling path.
-    ///
-    /// `wipeGeneration` is this pipeline's generation captured at spawn (the
-    /// moment the pre-wipe `id` was captured); a mismatch at either main-actor
-    /// hop means a panic wipe happened in between, so the task bails without
-    /// decrypting (first hop) or without delivering the plaintext (second
-    /// hop) — the captured identity and any decrypted material are simply
-    /// dropped with the task.
-    private func processGeohashGiftWrap(
+    func processNostrMessage(
         _ giftWrap: NostrEvent,
-        id: NostrIdentity,
-        verbose: Bool,
-        wipeGeneration: UInt64
+        outerSignatureAlreadyVerified: Bool = false
+    ) async {
+        await processGiftWrap(
+            giftWrap,
+            geohashIdentity: nil,
+            initialWipeGeneration: nil,
+            outerSignatureAlreadyVerified: outerSignatureAlreadyVerified
+        )
+    }
+
+    /// Unified NIP-17 gift-wrap ingest for both geohash DMs (`geohashIdentity != nil`)
+    /// and account DMs (`geohashIdentity == nil`). Decryption and BitChat packet
+    /// decoding run off the main actor; dedup check-and-record and delivery run
+    /// atomically on `@MainActor` guarded by `wipeGeneration`.
+    private func processGiftWrap(
+        _ giftWrap: NostrEvent,
+        geohashIdentity: NostrIdentity?,
+        initialWipeGeneration: UInt64?,
+        outerSignatureAlreadyVerified: Bool
     ) async {
         guard let context else { return }
-        // Authoritative check-and-record, atomic on the main actor so two
-        // concurrent detached tasks can't both process the same event.
-        let alreadyProcessed: Bool = await MainActor.run {
-            guard self.wipeGeneration == wipeGeneration else { return true }
-            if context.hasProcessedNostrEvent(giftWrap.id) { return true }
+        let isGeohashDM = geohashIdentity != nil
+
+        // Single pre-decrypt main-actor hop: atomically check-and-record dedup
+        // AND resolve `(recipientIdentity, wipeGeneration)` so the generation
+        // vouches for exactly the identity used to decrypt.
+        let preDecrypt: (identity: NostrIdentity, wipeGeneration: UInt64)? = await MainActor.run {
+            if let expectedGen = initialWipeGeneration, self.wipeGeneration != expectedGen {
+                return nil
+            }
+            if context.hasProcessedNostrEvent(giftWrap.id) { return nil }
             context.recordProcessedNostrEvent(giftWrap.id)
-            return false
+            guard let identity = geohashIdentity ?? context.currentNostrIdentity() else { return nil }
+            return (identity, initialWipeGeneration ?? self.wipeGeneration)
         }
-        if alreadyProcessed { return }
+        guard let (recipientIdentity, wipeGeneration) = preDecrypt else { return }
 
-        guard let (content, senderPubkey, rumorTs) = try? NostrProtocol.decryptPrivateMessage(
-            giftWrap: giftWrap,
-            recipientIdentity: id
-        ) else {
-            if verbose {
+        let content: String
+        let senderPubkey: String
+        let rumorTimestamp: Int
+        do {
+            (content, senderPubkey, rumorTimestamp) = try NostrProtocol.decryptPrivateMessage(
+                giftWrap: giftWrap,
+                recipientIdentity: recipientIdentity,
+                outerSignatureAlreadyVerified: outerSignatureAlreadyVerified
+            )
+        } catch {
+            if isGeohashDM {
                 SecureLogger.warning("GeoDM: failed decrypt giftWrap id=\(giftWrap.id.prefix(8))…", category: .session)
+            } else {
+                SecureLogger.error("Failed to decrypt Nostr message: \(error)", category: .session)
             }
             return
         }
 
-        guard Self.isPlausibleRumorTimestamp(rumorTs) else {
-            if verbose {
-                SecureLogger.warning("GeoDM: dropping gift-wrap with implausible rumor timestamp id=\(giftWrap.id.prefix(8))…", category: .session)
-            }
+        guard Self.isPlausibleRumorTimestamp(rumorTimestamp) else {
+            let label = isGeohashDM ? "GeoDM: dropping gift-wrap" : "Dropping Nostr DM"
+            SecureLogger.warning("\(label) with implausible rumor timestamp id=\(giftWrap.id.prefix(8))…", category: .session)
             return
         }
 
-        if verbose {
+        if isGeohashDM {
             SecureLogger.debug(
                 "GeoDM: decrypted gift-wrap id=\(giftWrap.id.prefix(16))... from=\(senderPubkey.prefix(8))...",
                 category: .session
             )
-        }
-
-        await MainActor.run {
-            // A panic wipe during the off-main decrypt must not let the
-            // pre-wipe plaintext reach post-wipe state; drop it here, atomic
-            // with the wipe on the main actor.
-            guard self.wipeGeneration == wipeGeneration else { return }
-            guard let packet = Self.decodeEmbeddedBitChatPacket(from: content),
-                  packet.type == MessageType.noiseEncrypted.rawValue,
-                  let payload = NoisePayload.decode(packet.payload)
-            else {
+        } else {
+            if content.hasPrefix("verify:") { return }
+            guard content.hasPrefix("bitchat1:") else {
+                SecureLogger.debug("Ignoring non-embedded Nostr DM content", category: .session)
                 return
             }
+        }
 
-            let convKey = PeerID(nostr_: senderPubkey)
+        guard let packet = Self.decodeEmbeddedBitChatPacket(from: content) else {
+            if !isGeohashDM {
+                SecureLogger.error("Failed to decode embedded BitChat packet from Nostr DM", category: .session)
+            }
+            return
+        }
+
+        guard packet.type == MessageType.noiseEncrypted.rawValue,
+              let payload = NoisePayload.decode(packet.payload) else {
+            return
+        }
+
+        let messageTimestamp = Date(timeIntervalSince1970: TimeInterval(rumorTimestamp))
+        await MainActor.run {
+            // Drop pre-wipe plaintext if a panic wipe landed during the off-main decrypt.
+            guard self.wipeGeneration == wipeGeneration else { return }
+
+            let convKey: PeerID
+            if isGeohashDM {
+                convKey = PeerID(nostr_: senderPubkey)
+            } else {
+                let actualSenderNoiseKey = self.findNoiseKey(for: senderPubkey)
+                convKey = PeerID(str: actualSenderNoiseKey?.hexEncodedString()) ?? PeerID(nostr_: senderPubkey)
+            }
             context.registerNostrKeyMapping(senderPubkey, for: convKey)
 
             switch payload.type {
             case .privateMessage:
-                let messageTimestamp = Date(timeIntervalSince1970: TimeInterval(rumorTs))
                 context.handlePrivateMessage(
                     payload,
                     senderPubkey: senderPubkey,
                     convKey: convKey,
-                    id: id,
+                    id: recipientIdentity,
                     messageTimestamp: messageTimestamp
                 )
             case .delivered:
                 context.handleDelivered(payload, senderPubkey: senderPubkey, convKey: convKey)
             case .readReceipt:
                 context.handleReadReceipt(payload, senderPubkey: senderPubkey, convKey: convKey)
-            // Group state travels only over mesh Noise sessions in v1; anything
-            // claiming to be group traffic over Nostr is ignored.
-            // Live voice is mesh-only: latency and relay cost make it
-            // meaningless over Nostr.
+            // Group state and live voice are mesh-only in v1.
             case .verifyChallenge, .verifyResponse, .groupInvite, .groupKeyUpdate, .vouch, .voiceFrame, .privateFile, .authenticatedPeerState:
                 break
             }
-        }
-    }
-
-    @MainActor
-    func handleNostrMessage(_ giftWrap: NostrEvent) {
-        guard let context else { return }
-        // Cheap dedup pre-check only; processNostrMessage does the
-        // authoritative check-and-record before the off-main NIP-17 unwrap.
-        // The outer signature was already verified (exactly once, off the
-        // main actor) by NostrRelayManager, and only verified events are
-        // recorded, so a forged-signature copy can never poison the dedup
-        // set and suppress the genuine event.
-        if context.hasProcessedNostrEvent(giftWrap.id) { return }
-
-        Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.processNostrMessage(giftWrap)
-        }
-    }
-
-    func processNostrMessage(_ giftWrap: NostrEvent) async {
-        guard let context else { return }
-        // Authoritative check-and-record, atomic on the main actor so two
-        // concurrent detached tasks can't both process the same event.
-        let alreadyProcessed: Bool = await MainActor.run {
-            if context.hasProcessedNostrEvent(giftWrap.id) { return true }
-            context.recordProcessedNostrEvent(giftWrap.id)
-            return false
-        }
-        if alreadyProcessed { return }
-        // Fetch the identity and the wipe generation in ONE main-actor hop:
-        // the generation then vouches for exactly this identity. A wipe after
-        // this point bumps the generation and the delivery hop below drops
-        // the decrypted result (same guard as processGeohashGiftWrap; this
-        // account-mailbox path had the identical hazard).
-        let (currentIdentity, wipeGeneration): (NostrIdentity?, UInt64) = await MainActor.run {
-            (context.currentNostrIdentity(), self.wipeGeneration)
-        }
-        guard let currentIdentity else { return }
-
-        do {
-            let (content, senderPubkey, rumorTimestamp) = try NostrProtocol.decryptPrivateMessage(
-                giftWrap: giftWrap,
-                recipientIdentity: currentIdentity
-            )
-
-            guard Self.isPlausibleRumorTimestamp(rumorTimestamp) else {
-                SecureLogger.warning("Dropping Nostr DM with implausible rumor timestamp id=\(giftWrap.id.prefix(8))…", category: .session)
-                return
-            }
-
-            if content.hasPrefix("verify:") {
-                return
-            }
-
-            if content.hasPrefix("bitchat1:") {
-                let packet: BitchatPacket? = await MainActor.run {
-                    Self.decodeEmbeddedBitChatPacket(from: content)
-                }
-                guard let packet else {
-                    SecureLogger.error("Failed to decode embedded BitChat packet from Nostr DM", category: .session)
-                    return
-                }
-
-                let actualSenderNoiseKey: Data? = await MainActor.run {
-                    self.findNoiseKey(for: senderPubkey)
-                }
-                let targetPeerID = PeerID(str: actualSenderNoiseKey?.hexEncodedString()) ?? PeerID(nostr_: senderPubkey)
-
-                if packet.type == MessageType.noiseEncrypted.rawValue,
-                   let payload = NoisePayload.decode(packet.payload) {
-                    let messageTimestamp = Date(timeIntervalSince1970: TimeInterval(rumorTimestamp))
-                    await MainActor.run {
-                        // Drop pre-wipe plaintext if a panic wipe landed
-                        // during the off-main decrypt (see above).
-                        guard self.wipeGeneration == wipeGeneration else { return }
-                        context.registerNostrKeyMapping(senderPubkey, for: targetPeerID)
-
-                        switch payload.type {
-                        case .privateMessage:
-                            context.handlePrivateMessage(
-                                payload,
-                                senderPubkey: senderPubkey,
-                                convKey: targetPeerID,
-                                id: currentIdentity,
-                                messageTimestamp: messageTimestamp
-                            )
-                        case .delivered:
-                            context.handleDelivered(payload, senderPubkey: senderPubkey, convKey: targetPeerID)
-                        case .readReceipt:
-                            context.handleReadReceipt(payload, senderPubkey: senderPubkey, convKey: targetPeerID)
-                        // Group state travels only over mesh Noise sessions
-                        // in v1; group traffic over Nostr is ignored.
-                        // Live voice is mesh-only: latency and relay cost make it
-                        // meaningless over Nostr.
-                        case .verifyChallenge, .verifyResponse, .groupInvite, .groupKeyUpdate, .vouch, .voiceFrame, .privateFile, .authenticatedPeerState:
-                            break
-                        }
-                    }
-                }
-            } else {
-                SecureLogger.debug("Ignoring non-embedded Nostr DM content", category: .session)
-            }
-        } catch {
-            SecureLogger.error("Failed to decrypt Nostr message: \(error)", category: .session)
         }
     }
 
@@ -540,35 +387,11 @@ final class NostrInboundPipeline {
     @MainActor
     func findNoiseKey(for nostrPubkey: String) -> Data? {
         guard let context else { return nil }
-        let favorites = context.allFavoriteRelationships()
-        var npubToMatch = nostrPubkey
-
-        if !nostrPubkey.hasPrefix("npub") {
-            if let pubkeyData = Data(hexString: nostrPubkey),
-               let encoded = try? Bech32.encode(hrp: "npub", data: pubkeyData) {
-                npubToMatch = encoded
-            } else {
-                SecureLogger.warning(
-                    "⚠️ Invalid hex public key format or encoding failed: \(nostrPubkey.prefix(16))...",
-                    category: .session
-                )
-            }
+        if let noiseKey = context.favoriteNoiseKey(forNostrPubkey: nostrPubkey) {
+            return noiseKey
         }
-
-        for relationship in favorites {
-            if let storedNostrKey = relationship.peerNostrPublicKey {
-                if storedNostrKey == npubToMatch {
-                    return relationship.peerNoisePublicKey
-                }
-                if !storedNostrKey.hasPrefix("npub") && storedNostrKey == nostrPubkey {
-                    SecureLogger.debug("✅ Found Noise key for Nostr sender (hex match)", category: .session)
-                    return relationship.peerNoisePublicKey
-                }
-            }
-        }
-
         SecureLogger.debug(
-            "⚠️ No matching Noise key found for Nostr pubkey: \(nostrPubkey.prefix(16))... (tried npub: \(npubToMatch.prefix(16))...)",
+            "⚠️ No matching Noise key found for Nostr pubkey: \(nostrPubkey.prefix(16))...",
             category: .session
         )
         return nil
@@ -592,8 +415,7 @@ extension NostrInboundPipeline {
 }
 
 private extension NostrInboundPipeline {
-    @MainActor
-    static func decodeEmbeddedBitChatPacket(from content: String) -> BitchatPacket? {
+    nonisolated static func decodeEmbeddedBitChatPacket(from content: String) -> BitchatPacket? {
         guard content.hasPrefix("bitchat1:") else { return nil }
         let encoded = String(content.dropFirst("bitchat1:".count))
         let maxBytes = FileTransferLimits.maxFramedFileBytes

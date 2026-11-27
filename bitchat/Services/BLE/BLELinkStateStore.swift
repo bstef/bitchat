@@ -20,6 +20,9 @@ struct BLEPeripheralLinkState {
 struct BLEDirectLinkState: Equatable {
     let hasPeripheral: Bool
     let hasCentral: Bool
+
+    static let none = BLEDirectLinkState(hasPeripheral: false, hasCentral: false)
+    var isConnected: Bool { hasPeripheral || hasCentral }
 }
 
 struct BLESubscribedCentralSnapshot {
@@ -77,9 +80,18 @@ final class BLELinkStateStore {
         return subscribedCentrals.count
     }
 
+    var hasActiveLinks: Bool {
+        assertOwned()
+        return !subscribedCentrals.isEmpty || peripherals.values.contains { $0.isConnected }
+    }
+
     var connectedOrConnectingPeripheralCount: Int {
         assertOwned()
-        return peripherals.values.filter { $0.isConnected || $0.isConnecting }.count
+        var count = 0
+        for state in peripherals.values where state.isConnected || state.isConnecting {
+            count += 1
+        }
+        return count
     }
 
     func state(forPeripheralID peripheralID: String) -> BLEPeripheralLinkState? {

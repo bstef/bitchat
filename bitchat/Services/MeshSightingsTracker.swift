@@ -21,18 +21,21 @@ final class MeshSightingsTracker: ObservableObject {
         static let dayKey = "meshSightings.dayKey"
         static let salt = "meshSightings.salt"
         static let hashes = "meshSightings.hashes"
-        static let lastSeenAt = "meshSightings.lastSeenAt"
+        /// Legacy timestamp key written by earlier builds; still cleared on panic.
+        static let legacyLastSeenAt = "meshSightings.lastSeenAt"
     }
 
     /// Distinct devices seen within range today (rotating peer IDs may count
     /// a long-lived neighbor more than once across rotations; that is fine
     /// for an ambient stat).
     @Published private(set) var todayCount: Int = 0
-    @Published private(set) var lastSightingAt: Date?
 
     private let defaults: UserDefaults
     private let now: () -> Date
     private var seenHashes: Set<String> = []
+    private var seenPeerIDsToday: Set<String> = []
+    private var currentDayKey: String = ""
+    private var currentSalt: Data = Data()
 
     init(defaults: UserDefaults = .standard, now: @escaping () -> Date = { Date() }) {
         self.defaults = defaults
@@ -40,64 +43,90 @@ final class MeshSightingsTracker: ObservableObject {
         restore()
     }
 
-    func recordSighting(peerID: PeerID) {
-        rollOverIfNeeded()
-        let hash = saltedHash(peerID.id)
+    func recordSightings(_ peerIDs: [PeerID]) {
+        guard !peerIDs.isEmpty else { return }
         let seenAt = now()
-        lastSightingAt = seenAt
-        defaults.set(seenAt, forKey: Keys.lastSeenAt)
-        guard seenHashes.insert(hash).inserted else { return }
-        todayCount = seenHashes.count
-        defaults.set(Array(seenHashes), forKey: Keys.hashes)
+        rollOverIfNeeded(at: seenAt)
+
+        var insertedAnyHash = false
+        for peerID in peerIDs {
+            let rawID = peerID.id
+            guard seenPeerIDsToday.insert(rawID).inserted else { continue }
+            let hash = saltedHash(rawID)
+            if seenHashes.insert(hash).inserted {
+                insertedAnyHash = true
+            }
+        }
+
+        if insertedAnyHash {
+            todayCount = seenHashes.count
+            defaults.set(Array(seenHashes), forKey: Keys.hashes)
+        }
     }
 
-    /// Re-evaluates the day boundary for the UI. `recordSighting` handles
+    /// Re-evaluates the day boundary for the UI. `recordSightings` handles
     /// rollover when peers are seen, but an idle app open across midnight
     /// would otherwise keep showing yesterday's tally until the next sighting;
     /// the empty-state view calls this on its periodic refresh tick.
     func refreshForDisplay() {
-        rollOverIfNeeded()
+        rollOverIfNeeded(at: now())
     }
 
     func clear() {
         seenHashes.removeAll()
+        seenPeerIDsToday.removeAll()
+        currentDayKey = ""
+        currentSalt = Data()
         todayCount = 0
-        lastSightingAt = nil
         defaults.removeObject(forKey: Keys.dayKey)
         defaults.removeObject(forKey: Keys.salt)
         defaults.removeObject(forKey: Keys.hashes)
-        defaults.removeObject(forKey: Keys.lastSeenAt)
+        defaults.removeObject(forKey: Keys.legacyLastSeenAt)
     }
 
     private func restore() {
-        rollOverIfNeeded()
+        rollOverIfNeeded(at: now())
         seenHashes = Set(defaults.stringArray(forKey: Keys.hashes) ?? [])
         todayCount = seenHashes.count
-        lastSightingAt = defaults.object(forKey: Keys.lastSeenAt) as? Date
     }
 
     /// Resets the tally when the local calendar day changes; the salt rotates
     /// with it so hashes from different days can never be correlated.
-    private func rollOverIfNeeded() {
-        let today = Self.dayKey(for: now())
-        guard defaults.string(forKey: Keys.dayKey) != today else { return }
+    private func rollOverIfNeeded(at date: Date) {
+        let today = Self.dayKey(for: date)
+        if currentDayKey == today && !currentSalt.isEmpty {
+            return
+        }
+        if defaults.string(forKey: Keys.dayKey) == today {
+            currentDayKey = today
+            if let persistedSalt = defaults.data(forKey: Keys.salt), !persistedSalt.isEmpty {
+                currentSalt = persistedSalt
+            } else {
+                let fresh = Self.randomSalt()
+                currentSalt = fresh
+                defaults.set(fresh, forKey: Keys.salt)
+            }
+            return
+        }
+        let freshSalt = Self.randomSalt()
+        currentDayKey = today
+        currentSalt = freshSalt
         defaults.set(today, forKey: Keys.dayKey)
-        defaults.set(Self.randomSalt(), forKey: Keys.salt)
+        defaults.set(freshSalt, forKey: Keys.salt)
         defaults.removeObject(forKey: Keys.hashes)
-        defaults.removeObject(forKey: Keys.lastSeenAt)
         seenHashes.removeAll()
+        seenPeerIDsToday.removeAll()
         todayCount = 0
-        lastSightingAt = nil
     }
 
     private func saltedHash(_ value: String) -> String {
-        let salt = defaults.data(forKey: Keys.salt) ?? {
+        if currentSalt.isEmpty {
             let fresh = Self.randomSalt()
+            currentSalt = fresh
             defaults.set(fresh, forKey: Keys.salt)
-            return fresh
-        }()
+        }
         var digest = SHA256()
-        digest.update(data: salt)
+        digest.update(data: currentSalt)
         digest.update(data: Data(value.utf8))
         return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }

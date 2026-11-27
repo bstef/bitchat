@@ -126,6 +126,142 @@ struct BLEInboundWriteBufferTests {
         }
     }
 
+    @Test
+    func removeForCentralDropsOnlyThatCentralsPartialBuffer() throws {
+        var buffer = BLEInboundWriteBuffer()
+        let packet = makePacket(timestamp: 0x123456)
+        let frame = try #require(packet.toBinaryData(padding: false))
+        let splitIndex = max(1, frame.count / 2)
+
+        _ = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: 0, data: frame.prefix(splitIndex))],
+            for: "central-1",
+            capBytes: 1024
+        )
+        _ = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: 0, data: frame.prefix(splitIndex))],
+            for: "central-2",
+            capBytes: 1024
+        )
+
+        buffer.remove(for: "central-1")
+
+        let c1Result = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: splitIndex, data: frame.suffix(from: splitIndex))],
+            for: "central-1",
+            capBytes: 1024
+        )
+        if case .waiting = c1Result {
+            // Expected: central-1's partial buffer was cleared on disconnect.
+        } else {
+            Issue.record("Expected central-1 partial buffer to be cleared")
+        }
+
+        let c2Result = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: splitIndex, data: frame.suffix(from: splitIndex))],
+            for: "central-2",
+            capBytes: 1024
+        )
+        if case let .decoded(decoded, _) = c2Result {
+            #expect(decoded.timestamp == packet.timestamp)
+        } else {
+            Issue.record("Expected central-2 partial buffer to remain intact")
+        }
+    }
+
+    @Test
+    func extremeOrNegativeOffsetRejectsWithoutAllocating() {
+        var buffer = BLEInboundWriteBuffer()
+
+        let hugeOffsetResult = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: 1_000_000_000, data: Data([0x01, 0x02]))],
+            for: "attacker-huge",
+            capBytes: 1024
+        )
+        if case .oversized = hugeOffsetResult {
+            // Rejected immediately before allocating zero-fill padding.
+        } else {
+            Issue.record("Expected huge offset to be rejected as oversized")
+        }
+
+        let overflowResult = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: Int.max - 1, data: Data([0x01, 0x02, 0x03]))],
+            for: "attacker-overflow",
+            capBytes: 1024
+        )
+        if case .oversized = overflowResult {
+            // Expected overflow guard.
+        } else {
+            Issue.record("Expected overflowing offset+length to be rejected")
+        }
+
+        let negativeResult = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: -4, data: Data([0x01]))],
+            for: "attacker-neg",
+            capBytes: 1024
+        )
+        if case .oversized = negativeResult {
+            // Expected negative offset guard.
+        } else {
+            Issue.record("Expected negative offset to be rejected")
+        }
+    }
+
+    @Test
+    func removeForCentralAndMaxTrackedCentralsBoundState() throws {
+        var buffer = BLEInboundWriteBuffer()
+        let packet = makePacket()
+        let frame = try #require(packet.toBinaryData(padding: false))
+        let splitIndex = max(1, frame.count / 2)
+
+        _ = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: 0, data: frame.prefix(splitIndex))],
+            for: "central-a",
+            capBytes: 1024,
+            maxTrackedCentrals: 2
+        )
+        _ = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: 0, data: frame.prefix(splitIndex))],
+            for: "central-b",
+            capBytes: 1024,
+            maxTrackedCentrals: 2
+        )
+        // Third central evicts oldest ("central-a").
+        _ = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: 0, data: frame.prefix(splitIndex))],
+            for: "central-c",
+            capBytes: 1024,
+            maxTrackedCentrals: 2
+        )
+
+        // Removing central-b explicitly drops its partial buffer.
+        buffer.remove(for: "central-b")
+
+        let aSecondHalf = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: splitIndex, data: frame.suffix(from: splitIndex))],
+            for: "central-a",
+            capBytes: 1024,
+            maxTrackedCentrals: 2
+        )
+        if case .waiting = aSecondHalf {
+            // Expected: central-a was evicted by cap.
+        } else {
+            Issue.record("Expected evicted central-a partial buffer to be gone")
+        }
+
+        let bSecondHalf = buffer.append(
+            chunks: [BLEInboundWriteChunk(offset: splitIndex, data: frame.suffix(from: splitIndex))],
+            for: "central-b",
+            capBytes: 1024,
+            maxTrackedCentrals: 2
+        )
+        if case .waiting = bSecondHalf {
+            // Expected: central-b was removed explicitly.
+        } else {
+            Issue.record("Expected explicitly removed central-b partial buffer to be gone")
+        }
+    }
+
     private func makePacket(timestamp: UInt64 = 0x0102030405) -> BitchatPacket {
         BitchatPacket(
             type: MessageType.message.rawValue,

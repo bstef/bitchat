@@ -26,42 +26,49 @@ struct BitchatFilePacket {
         case content = 0x04
     }
 
+    /// Zero-allocation preflight check matching `encode()` validation rules.
+    var canEncode: Bool {
+        let resolvedSize = fileSize ?? UInt64(content.count)
+        guard resolvedSize <= UInt64(UInt32.max) else { return false }
+        guard resolvedSize <= UInt64(FileTransferLimits.maxPayloadBytes) else { return false }
+        guard content.count <= Int(UInt32.max) else { return false }
+        return FileTransferLimits.isValidPayload(content.count)
+    }
+
     /// Encodes the packet using v2 canonical TLVs (4-byte FILE_SIZE, 4-byte CONTENT length).
     /// Returns `nil` when fields exceed protocol limits (e.g., content > UInt32.max).
     func encode() -> Data? {
+        guard canEncode else { return nil }
         let resolvedSize = fileSize ?? UInt64(content.count)
-        guard resolvedSize <= UInt64(UInt32.max) else { return nil }
-        guard resolvedSize <= UInt64(FileTransferLimits.maxPayloadBytes) else { return nil }
-        guard content.count <= Int(UInt32.max) else { return nil }
-        guard FileTransferLimits.isValidPayload(content.count) else { return nil }
 
-        func appendBE<T: FixedWidthInteger>(_ value: T, into data: inout Data) {
-            var big = value.bigEndian
-            withUnsafeBytes(of: &big) { data.append(contentsOf: $0) }
+        let nameData: Data? = {
+            guard let name = fileName, let d = name.data(using: .utf8), d.count <= Int(UInt16.max) else { return nil }
+            return d
+        }()
+        let mimeData: Data? = {
+            guard let mime = mimeType, let d = mime.data(using: .utf8), d.count <= Int(UInt16.max) else { return nil }
+            return d
+        }()
+
+        let capacity = (nameData.map { 3 + $0.count } ?? 0)
+            + 7
+            + (mimeData.map { 3 + $0.count } ?? 0)
+            + 5 + content.count
+        var writer = TLVWriter(lengthWidth: .twoBytes, capacity: capacity)
+
+        if let nameData {
+            writer.append(TLVType.fileName.rawValue, nameData)
+        }
+        writer.append(TLVType.fileSize.rawValue, bigEndian: UInt32(resolvedSize))
+        if let mimeData {
+            writer.append(TLVType.mimeType.rawValue, mimeData)
         }
 
-        var encoded = Data()
-
-        if let name = fileName, let nameData = name.data(using: .utf8), nameData.count <= Int(UInt16.max) {
-            encoded.append(TLVType.fileName.rawValue)
-            appendBE(UInt16(nameData.count), into: &encoded)
-            encoded.append(nameData)
-        }
-
-        encoded.append(TLVType.fileSize.rawValue)
-        appendBE(UInt16(4), into: &encoded)
-        appendBE(UInt32(resolvedSize), into: &encoded)
-
-        if let mime = mimeType, let mimeData = mime.data(using: .utf8), mimeData.count <= Int(UInt16.max) {
-            encoded.append(TLVType.mimeType.rawValue)
-            appendBE(UInt16(mimeData.count), into: &encoded)
-            encoded.append(mimeData)
-        }
-
+        // CONTENT uses a 4-byte BE length per v2 canonical file TLV spec.
+        var encoded = writer.data
         encoded.append(TLVType.content.rawValue)
-        appendBE(UInt32(content.count), into: &encoded)
+        encoded.appendBigEndian(UInt32(content.count))
         encoded.append(content)
-
         return encoded
     }
 
@@ -219,10 +226,7 @@ enum PrivateMediaMessageIdentity {
         var input = domain
         for field in fields {
             guard let length = UInt32(exactly: field.count) else { return nil }
-            var bigEndianLength = length.bigEndian
-            withUnsafeBytes(of: &bigEndianLength) {
-                input.append(contentsOf: $0)
-            }
+            input.appendBigEndian(length)
             input.append(field)
         }
 

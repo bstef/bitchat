@@ -1,130 +1,6 @@
 import BitLogger
 import Foundation
-import Network
 import Combine
-import Tor
-
-protocol NostrRelayConnectionProtocol: AnyObject {
-    func resume()
-    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
-    func send(_ message: URLSessionWebSocketTask.Message, completionHandler: @escaping (Error?) -> Void)
-    func receive(completionHandler: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void)
-    func sendPing(pongReceiveHandler: @escaping (Error?) -> Void)
-}
-
-protocol NostrRelaySessionProtocol {
-    func webSocketTask(with url: URL) -> NostrRelayConnectionProtocol
-}
-
-private final class URLSessionWebSocketTaskAdapter: NostrRelayConnectionProtocol {
-    private let base: URLSessionWebSocketTask
-
-    init(base: URLSessionWebSocketTask) {
-        self.base = base
-    }
-
-    func resume() {
-        base.resume()
-    }
-
-    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        base.cancel(with: closeCode, reason: reason)
-    }
-
-    func send(_ message: URLSessionWebSocketTask.Message, completionHandler: @escaping (Error?) -> Void) {
-        base.send(message, completionHandler: completionHandler)
-    }
-
-    func receive(completionHandler: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void) {
-        base.receive(completionHandler: completionHandler)
-    }
-
-    func sendPing(pongReceiveHandler: @escaping (Error?) -> Void) {
-        base.sendPing(pongReceiveHandler: pongReceiveHandler)
-    }
-}
-
-private struct URLSessionAdapter: NostrRelaySessionProtocol {
-    let base: URLSession
-
-    func webSocketTask(with url: URL) -> NostrRelayConnectionProtocol {
-        let task = base.webSocketTask(with: url)
-        // Byte bound per inbound frame; without it the per-relay buffer cap
-        // (nostrInboundPerRelayBufferCap) bounds FRAMES but not BYTES, and a
-        // hostile relay could pile up cap × 1 MiB (URLSession default) per
-        // connection. See TransportConfig.nostrInboundMaxFrameBytes for the
-        // sizing rationale. Oversized frames fail the receive with an error.
-        task.maximumMessageSize = TransportConfig.nostrInboundMaxFrameBytes
-        return URLSessionWebSocketTaskAdapter(base: task)
-    }
-}
-
-struct NostrRelayManagerDependencies {
-    var activationAllowed: () -> Bool
-    var userTorEnabled: () -> Bool
-    var hasMutualFavorites: () -> Bool
-    var hasLocationPermission: () -> Bool
-    var mutualFavoritesPublisher: AnyPublisher<Set<Data>, Never>
-    var locationPermissionPublisher: AnyPublisher<LocationChannelManager.PermissionState, Never>
-    var torEnforced: () -> Bool
-    var torIsReady: () -> Bool
-    var torIsForeground: () -> Bool
-    var awaitTorReady: (@escaping (Bool) -> Void) -> Void
-    var makeSession: () -> NostrRelaySessionProtocol
-    var scheduleAfter: @Sendable (TimeInterval, @escaping @Sendable () -> Void) -> Void
-    var now: () -> Date
-    /// Uniform random value in [0, 1) used to jitter reconnect backoff.
-    /// Injectable so tests can pin or sweep the jitter deterministically.
-    var jitterUnit: () -> Double
-    /// Where relay-settings changes are observed. Injectable so a test can use
-    /// its own center instead of racing the process-wide one.
-    var notificationCenter: NotificationCenter = .default
-    /// Relays added by hand, merged with the built-in set. Injectable so tests
-    /// do not have to write to shared preferences.
-    var customRelays: () -> [String] = { NostrRelaySettings.customRelays() }
-    /// Whether a location channel is currently open. Mirrors the third arm of
-    /// `NetworkActivationService`'s gate: teleporting into a geohash needs no
-    /// location permission, and without this the relays would stay filtered out
-    /// for someone who denied location and has no mutual favorites.
-    var isInLocationChannel: () -> Bool = { false }
-    var selectedChannelPublisher: AnyPublisher<ChannelID, Never> = Empty().eraseToAnyPublisher()
-}
-
-private extension NostrRelayManagerDependencies {
-    @MainActor
-    static func live() -> Self {
-        Self(
-            activationAllowed: { NetworkActivationService.shared.activationAllowed },
-            userTorEnabled: { NetworkActivationService.shared.userTorEnabled },
-            hasMutualFavorites: { !FavoritesPersistenceService.shared.mutualFavorites.isEmpty },
-            hasLocationPermission: { LocationChannelManager.shared.permissionState == .authorized },
-            mutualFavoritesPublisher: FavoritesPersistenceService.shared.$mutualFavorites.eraseToAnyPublisher(),
-            locationPermissionPublisher: LocationChannelManager.shared.$permissionState.eraseToAnyPublisher(),
-            torEnforced: { TorManager.shared.torEnforced },
-            torIsReady: { TorManager.shared.isReady },
-            torIsForeground: { TorManager.shared.isForeground() },
-            awaitTorReady: { completion in
-                Task.detached {
-                    let ready = await TorManager.shared.awaitReady()
-                    await MainActor.run {
-                        completion(ready)
-                    }
-                }
-            },
-            makeSession: { URLSessionAdapter(base: TorURLSession.shared.session) },
-            scheduleAfter: { delay, action in
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
-            },
-            now: Date.init,
-            jitterUnit: { Double.random(in: 0..<1) },
-            isInLocationChannel: {
-                if case .location = LocationChannelManager.shared.selectedChannel { return true }
-                return false
-            },
-            selectedChannelPublisher: LocationChannelManager.shared.$selectedChannel.eraseToAnyPublisher()
-        )
-    }
-}
 
 /// Manages WebSocket connections to Nostr relays
 @MainActor
@@ -186,7 +62,10 @@ final class NostrRelayManager: ObservableObject {
         defaultRelaySet = Set(defaultRelays)
     }
 
-    @Published private(set) var relays: [Relay] = []
+    // Kept non-@Published: no UI observes `$relays`, and mutating per-relay
+    // packet counters (`messagesReceived`/`messagesSent`) on every frame
+    // previously triggered `objectWillChange` storms on the main actor.
+    private(set) var relays: [Relay] = []
     @Published private(set) var isConnected = false
     /// Whether a relay that carries private messages is connected. DMs
     /// target the default (gift-wrap-capable) relay set, so a connected
@@ -267,7 +146,6 @@ final class NostrRelayManager: ObservableObject {
         var pendingRelays: Set<String>
     }
     private var messageQueue: [PendingSend] = []
-    private let messageQueueLock = NSLock()
     /// Non-queued sends whose callers require relay durability. A WebSocket
     /// write only proves bytes left this process; NIP-01 `OK` is the relay's
     /// accept/reject acknowledgment.
@@ -291,6 +169,8 @@ final class NostrRelayManager: ObservableObject {
     
     // Bump generation to invalidate scheduled reconnects when we reset/disconnect
     private var connectionGeneration: Int = 0
+    /// Per-relay cancellation tokens for scheduled idle teardowns of non-default relays.
+    private var idleTeardownTokens: [String: UUID] = [:]
 
     // Per-relay off-main inbound pipeline: raw socket frames are parsed and
     // Schnorr-verified in arrival order OFF the main actor (this is the single
@@ -390,8 +270,8 @@ final class NostrRelayManager: ObservableObject {
     ///    check-and-RECORD plus handler dispatch. Recording only after
     ///    verification means a forged-signature copy can never poison the
     ///    dedup cache and suppress the genuine event.
-    private func ensureRelayInboundPipeline(for relayUrl: String) {
-        let started = inboundRouter.startPipeline(for: relayUrl) { [weak self] stream in
+    private func ensureRelayInboundPipeline(for relayUrl: String, connectionID: ObjectIdentifier) {
+        let started = inboundRouter.startPipeline(for: relayUrl, connectionID: connectionID) { [weak self] stream in
             Task.detached(priority: .userInitiated) {
                 for await frame in stream {
                     guard let parsed = ParsedInbound(frame.message) else { continue }
@@ -405,7 +285,7 @@ final class NostrRelayManager: ObservableObject {
                         ) else {
                             continue
                         }
-                        guard event.isValidSignature() else {
+                        guard await self.inboundRouter.verifySignatureCoalesced(event) else {
                             SecureLogger.warning(
                                 "⚠️ Dropped invalid Nostr event id=\(event.id.prefix(16))… sub=\(subId) relay=\(relayUrl)",
                                 category: .session
@@ -413,7 +293,7 @@ final class NostrRelayManager: ObservableObject {
                             continue
                         }
                         await self.deliverVerifiedInboundEvent(subscriptionID: subId, event: event, from: relayUrl)
-                    case .eose, .ok, .notice:
+                    case .eose, .ok:
                         await self.handleParsedMessage(parsed, from: relayUrl)
                     }
                 }
@@ -445,6 +325,7 @@ final class NostrRelayManager: ObservableObject {
     /// Disconnect from all relays
     func disconnect() {
         connectionGeneration &+= 1
+        idleTeardownTokens.removeAll()
         for (_, task) in connections {
             task.cancel(with: .goingAway, reason: nil)
         }
@@ -479,6 +360,7 @@ final class NostrRelayManager: ObservableObject {
     /// can capture pre-wipe Nostr private keys.
     func resetForPanicWipe() {
         connectionGeneration &+= 1
+        idleTeardownTokens.removeAll()
         for (_, task) in connections {
             task.cancel(with: .goingAway, reason: nil)
         }
@@ -503,10 +385,8 @@ final class NostrRelayManager: ObservableObject {
         Self.pendingGiftWrapIDs.removeAll()
         confirmedSends.removeAll()
 
-        messageQueueLock.lock()
         messageQueue.removeAll()
         pendingSendDropCount = 0
-        messageQueueLock.unlock()
 
         updateConnectionStatus()
     }
@@ -535,9 +415,12 @@ final class NostrRelayManager: ObservableObject {
         let targets = allowedRelayList(from: relayUrls)
         guard !targets.isEmpty else { return }
         var existing = Set(relays.map { $0.url })
-        for url in targets where !existing.contains(url) {
-            relays.append(Relay(url: url))
-            existing.insert(url)
+        for url in targets {
+            idleTeardownTokens.removeValue(forKey: url)
+            if !existing.contains(url) {
+                relays.append(Relay(url: url))
+                existing.insert(url)
+            }
         }
         connectToRelays(targets)
     }
@@ -564,9 +447,19 @@ final class NostrRelayManager: ObservableObject {
 
         // Attempt immediate send to relays with active connections; queue the rest
         var stillPending = Set<String>()
+        var encodedMessage: String?
         for relayUrl in targetRelays {
             if let connection = connectedConnection(for: relayUrl) {
-                sendToRelay(event: event, connection: connection, relayUrl: relayUrl)
+                if encodedMessage == nil {
+                    guard let encoded = encodeEventMessage(event) else { return }
+                    encodedMessage = encoded
+                }
+                sendEncodedToRelay(
+                    event: event,
+                    encodedMessage: encodedMessage!,
+                    connection: connection,
+                    relayUrl: relayUrl
+                )
             } else {
                 stillPending.insert(relayUrl)
             }
@@ -606,6 +499,10 @@ final class NostrRelayManager: ObservableObject {
             completion(false)
             return
         }
+        guard let encodedMessage = encodeEventMessage(event) else {
+            completion(false)
+            return
+        }
 
         let token = UUID()
         let eventID = event.id
@@ -624,7 +521,12 @@ final class NostrRelayManager: ObservableObject {
         }
 
         for (relayUrl, connection) in connectedTargets {
-            sendToRelay(event: event, connection: connection, relayUrl: relayUrl) { [weak self] succeeded in
+            sendEncodedToRelay(
+                event: event,
+                encodedMessage: encodedMessage,
+                connection: connection,
+                relayUrl: relayUrl
+            ) { [weak self] succeeded in
                 guard let self else { return }
                 // Success only means the bytes reached the socket; wait for
                 // the matching relay OK. A failed write settles this target
@@ -668,13 +570,11 @@ final class NostrRelayManager: ObservableObject {
     }
 
     private func enqueuePendingSend(_ event: NostrEvent, pendingRelays: Set<String>) {
-        messageQueueLock.lock()
         messageQueue.append(PendingSend(event: event, pendingRelays: pendingRelays))
         let overflow = messageQueue.count - TransportConfig.nostrPendingSendQueueCap
         if overflow > 0 {
             messageQueue.removeFirst(overflow)
         }
-        messageQueueLock.unlock()
         guard overflow > 0 else { return }
         // Dropped events are ephemeral (presence/geo), so no status surfacing
         // is needed — but the drops should be visible. Sampled so a sustained
@@ -691,8 +591,6 @@ final class NostrRelayManager: ObservableObject {
 
     /// Try to flush any queued messages for relays that are now connected.
     private func flushMessageQueue(for relayUrl: String? = nil) {
-        messageQueueLock.lock()
-        defer { messageQueueLock.unlock() }
         guard !messageQueue.isEmpty else { return }
         if let target = relayUrl {
             // Flush only for a specific relay
@@ -829,6 +727,7 @@ final class NostrRelayManager: ObservableObject {
     private func dropRelays(_ urls: Set<String>) {
         guard !urls.isEmpty else { return }
         for url in urls {
+            idleTeardownTokens.removeValue(forKey: url)
             if let connection = connections[url] {
                 connection.cancel(with: .goingAway, reason: nil)
             }
@@ -837,7 +736,6 @@ final class NostrRelayManager: ObservableObject {
             subscriptions.removeValue(forKey: url)
             pendingSubscriptions.removeValue(forKey: url)
         }
-        messageQueueLock.lock()
         for index in (0..<messageQueue.count).reversed() {
             var item = messageQueue[index]
             item.pendingRelays.subtract(urls)
@@ -847,7 +745,6 @@ final class NostrRelayManager: ObservableObject {
                 messageQueue[index] = item
             }
         }
-        messageQueueLock.unlock()
         // A relay queued while Tor bootstraps would otherwise reconnect when
         // the queue drains, overriding the explicit removal.
         pendingTorConnectionURLs.subtract(urls)
@@ -878,8 +775,11 @@ final class NostrRelayManager: ObservableObject {
         subscriptionRequestState.removeValue(forKey: id)
         pendingEOSECallbacks.removeValue(forKey: id)
         eoseTrackers.removeValue(forKey: id)
+        var affectedRelays = Set<String>()
         for url in Array(pendingSubscriptions.keys) {
-            pendingSubscriptions[url]?.removeValue(forKey: id)
+            if pendingSubscriptions[url]?.removeValue(forKey: id) != nil {
+                affectedRelays.insert(url)
+            }
         }
         
         let req = NostrRequest.close(id: id)
@@ -892,9 +792,55 @@ final class NostrRelayManager: ObservableObject {
         for (relayUrl, connection) in connections {
             if subscriptions[relayUrl]?.contains(id) == true {
                 subscriptions[relayUrl]?.remove(id)
+                affectedRelays.insert(relayUrl)
                 connection.send(.string(messageString)) { _ in
                     // Local state is cleared before sending so callers can re-subscribe immediately.
                 }
+            }
+        }
+
+        // Reclaim idle non-default (geohash/notes) relay sockets after a short
+        // grace window so switching channels does not accumulate dead sockets.
+        for relayUrl in affectedRelays {
+            scheduleIdleTeardownIfUnused(for: relayUrl)
+        }
+    }
+
+    private func hasPendingMessages(for relayUrl: String) -> Bool {
+        return messageQueue.contains { $0.pendingRelays.contains(relayUrl) }
+    }
+
+    private func isRelayIdle(_ relayUrl: String) -> Bool {
+        let hasActiveSubs = !(subscriptions[relayUrl]?.isEmpty ?? true)
+        let hasPendingSubs = !(pendingSubscriptions[relayUrl]?.isEmpty ?? true)
+        let hasConfirmedSends = confirmedSends.values.contains { $0.awaitingRelays.contains(relayUrl) }
+        return !hasActiveSubs && !hasPendingSubs && !hasConfirmedSends && !hasPendingMessages(for: relayUrl)
+    }
+
+    private func scheduleIdleTeardownIfUnused(for relayUrl: String) {
+        guard !defaultRelaySet.contains(relayUrl),
+              connections[relayUrl] != nil,
+              isRelayIdle(relayUrl) else {
+            return
+        }
+        let token = UUID()
+        idleTeardownTokens[relayUrl] = token
+        let generation = connectionGeneration
+        dependencies.scheduleAfter(TransportConfig.nostrIdleRelayTeardownSeconds) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.connectionGeneration == generation,
+                      self.idleTeardownTokens[relayUrl] == token else {
+                    return
+                }
+                self.idleTeardownTokens.removeValue(forKey: relayUrl)
+                guard !self.defaultRelaySet.contains(relayUrl),
+                      self.connections[relayUrl] != nil,
+                      self.isRelayIdle(relayUrl) else {
+                    return
+                }
+                SecureLogger.debug("🧹 Closing idle non-default Nostr relay: \(relayUrl)", category: .session)
+                self.dropRelays([relayUrl])
             }
         }
     }
@@ -1174,14 +1120,16 @@ final class NostrRelayManager: ObservableObject {
         let task = session.webSocketTask(with: url)
         
         connections[urlString] = task
+        idleTeardownTokens.removeValue(forKey: urlString)
         task.resume()
 
         // Bring up this relay's own serial verify pipeline before arming the
         // socket, so inbound frames have somewhere to land.
-        ensureRelayInboundPipeline(for: urlString)
+        let connectionID = ObjectIdentifier(task)
+        ensureRelayInboundPipeline(for: urlString, connectionID: connectionID)
 
-        // Start receiving messages
-        receiveMessage(from: task, relayUrl: urlString)
+        // Start receiving messages (re-arms directly off-main via InboundFrameRouter)
+        receiveMessage(from: task, relayUrl: urlString, connectionID: connectionID)
         
         // Send initial ping to verify connection
         task.sendPing { [weak self] error in
@@ -1248,28 +1196,25 @@ final class NostrRelayManager: ObservableObject {
         }
     }
     
-    private func receiveMessage(from task: NostrRelayConnectionProtocol, relayUrl: String) {
+    nonisolated private func receiveMessage(
+        from task: NostrRelayConnectionProtocol,
+        relayUrl: String,
+        connectionID: ObjectIdentifier
+    ) {
         task.receive { [weak self] result in
             guard let self = self else { return }
             
             switch result {
             case .success(let message):
-                // Hand the raw frame to this relay's serial inbound pipeline:
-                // parsing and signature verification run off-main, in arrival
-                // order, independently of every other relay's pipeline. Routing
-                // through the lock-guarded router keeps this off the main actor
-                // (no per-frame main hop).
-                self.inboundRouter.yield(InboundFrame(message: message), to: relayUrl)
-
-
-                // Continue receiving
-                Task { @MainActor in
-                    guard self.connections[relayUrl] === task else { return }
-                    self.receiveMessage(from: task, relayUrl: relayUrl)
+                // Hand the raw frame to this relay's serial inbound pipeline and
+                // re-arm directly off-main when this socket is still active —
+                // zero main-actor hop per WebSocket frame.
+                if self.inboundRouter.yield(InboundFrame(message: message), to: relayUrl, from: connectionID) {
+                    self.receiveMessage(from: task, relayUrl: relayUrl, connectionID: connectionID)
                 }
                 
             case .failure(let error):
-                DispatchQueue.main.async {
+                Task { @MainActor in
                     self.handleDisconnection(relayUrl: relayUrl, error: error, connection: task)
                 }
             }
@@ -1356,43 +1301,61 @@ final class NostrRelayManager: ObservableObject {
                     SecureLogger.error("📮 Rejected id=\(eventId.prefix(16))… relay=\(relayUrl) reason=\(reason)", category: .session)
                 }
             }
-        case .notice:
-            break
         }
     }
     
+    private func encodeEventMessage(_ event: NostrEvent) -> String? {
+        let req = NostrRequest.event(event)
+        do {
+            let data = try encoder.encode(req)
+            return String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            SecureLogger.error("Failed to encode event: \(error)", category: .session)
+            return nil
+        }
+    }
+
     private func sendToRelay(
         event: NostrEvent,
         connection: NostrRelayConnectionProtocol,
         relayUrl: String,
         completion: ((Bool) -> Void)? = nil
     ) {
-        let req = NostrRequest.event(event)
-        
-        do {
-            let data = try encoder.encode(req)
-            let message = String(data: data, encoding: .utf8) ?? ""
-            
-            SecureLogger.debug("📤 Send kind=\(event.kind) id=\(event.id.prefix(16))… relay=\(relayUrl)", category: .session)
-            
-            connection.send(.string(message)) { [weak self] error in
-                DispatchQueue.main.async {
-                    if let error = error {
-                        SecureLogger.error("❌ Failed to send event to \(relayUrl): \(error)", category: .session)
-                        completion?(false)
-                    } else {
-                        // SecureLogger.debug("✅ Event sent to relay: \(relayUrl)", category: .session)
-                        // Update relay stats
-                        if let index = self?.relays.firstIndex(where: { $0.url == relayUrl }) {
-                            self?.relays[index].messagesSent += 1
-                        }
-                        completion?(true)
+        guard let message = encodeEventMessage(event) else {
+            completion?(false)
+            return
+        }
+        sendEncodedToRelay(
+            event: event,
+            encodedMessage: message,
+            connection: connection,
+            relayUrl: relayUrl,
+            completion: completion
+        )
+    }
+
+    private func sendEncodedToRelay(
+        event: NostrEvent,
+        encodedMessage: String,
+        connection: NostrRelayConnectionProtocol,
+        relayUrl: String,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        SecureLogger.debug("📤 Send kind=\(event.kind) id=\(event.id.prefix(16))… relay=\(relayUrl)", category: .session)
+
+        connection.send(.string(encodedMessage)) { [weak self] error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    SecureLogger.error("❌ Failed to send event to \(relayUrl): \(error)", category: .session)
+                    completion?(false)
+                } else {
+                    // Update relay stats
+                    if let index = self?.relays.firstIndex(where: { $0.url == relayUrl }) {
+                        self?.relays[index].messagesSent += 1
                     }
+                    completion?(true)
                 }
             }
-        } catch {
-            SecureLogger.error("Failed to encode event: \(error)", category: .session)
-            completion?(false)
         }
     }
     
@@ -1415,10 +1378,16 @@ final class NostrRelayManager: ObservableObject {
     }
     
     private func updateConnectionStatus() {
-        isConnected = relays.contains { $0.isConnected }
+        let nextConnected = relays.contains { $0.isConnected }
+        if nextConnected != isConnected {
+            isConnected = nextConnected
+        }
         // Relay URLs are normalized before entries are created, so direct
         // set membership is sound.
-        isDMRelayConnected = relays.contains { $0.isConnected && defaultRelaySet.contains($0.url) }
+        let nextDMConnected = relays.contains { $0.isConnected && defaultRelaySet.contains($0.url) }
+        if nextDMConnected != isDMRelayConnected {
+            isDMRelayConnected = nextDMConnected
+        }
     }
     
     /// A relay that drops before sending EOSE must not stall initial-load
@@ -1463,6 +1432,7 @@ final class NostrRelayManager: ObservableObject {
     ) {
         if let connection, connections[relayUrl] !== connection { return }
         connections.removeValue(forKey: relayUrl)
+        idleTeardownTokens.removeValue(forKey: relayUrl)
         teardownRelayInboundPipeline(for: relayUrl)
         subscriptions.removeValue(forKey: relayUrl)
         let awaitingConfirmation = confirmedSends.compactMap { eventID, state in
@@ -1575,10 +1545,9 @@ final class NostrRelayManager: ObservableObject {
         }
     }
 
+    #if DEBUG
     var debugPendingMessageQueueCount: Int {
-        messageQueueLock.lock()
-        defer { messageQueueLock.unlock() }
-        return messageQueue.count
+        messageQueue.count
     }
 
     func debugPendingSubscriptionCount(for relayUrl: String) -> Int {
@@ -1613,6 +1582,7 @@ final class NostrRelayManager: ObservableObject {
     func debugFlushMessageQueue() {
         flushMessageQueue(for: nil)
     }
+    #endif
     
     /// Reset all relay connections
     func resetAllConnections() {
@@ -1648,299 +1618,5 @@ final class NostrRelayManager: ObservableObject {
             }
         }
         return false
-    }
-}
-
-// MARK: - Off-main inbound parsing helpers (file scope, non-isolated)
-
-/// A single raw socket frame awaiting off-main parse + Schnorr verification.
-private struct InboundFrame: Sendable {
-    let message: URLSessionWebSocketTask.Message
-}
-
-/// Lock-guarded registry of per-relay inbound streams.
-///
-/// The raw WebSocket receive callback is not main-actor isolated, so it needs a
-/// `Sendable` path to route a frame to the correct relay's stream without a
-/// per-frame hop onto the main actor. Pipeline lifecycle (start/finish) is
-/// driven from the main actor; frame delivery (`yield`) can come from any
-/// thread. All access is serialized by a single lock — contention is negligible
-/// because the guarded critical section is only a dictionary lookup + yield.
-private final class InboundFrameRouter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuations: [String: AsyncStream<InboundFrame>.Continuation] = [:]
-    private var tasks: [String: Task<Void, Never>] = [:]
-
-    /// Start a relay's stream + consumer if one does not already exist.
-    /// Returns true when a new pipeline was created. The bounded
-    /// `.bufferingNewest` policy makes a single relay shed its OWN oldest
-    /// frames under a flood, never other relays' frames. Buffered memory per
-    /// relay is bounded (not eliminated) at the frame cap times the per-frame
-    /// byte cap (`maximumMessageSize`) — see TransportConfig.
-    func startPipeline(
-        for relayUrl: String,
-        makeConsumer: (AsyncStream<InboundFrame>) -> Task<Void, Never>
-    ) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if continuations[relayUrl] != nil { return false }
-        let (stream, continuation) = AsyncStream<InboundFrame>.makeStream(
-            bufferingPolicy: .bufferingNewest(TransportConfig.nostrInboundPerRelayBufferCap)
-        )
-        continuations[relayUrl] = continuation
-        tasks[relayUrl] = makeConsumer(stream)
-        return true
-    }
-
-    /// Route a frame to a relay's stream. No-op if the relay has no live
-    /// pipeline (socket already torn down) — the frame is simply dropped, which
-    /// is safe for best-effort Nostr inbound.
-    func yield(_ frame: InboundFrame, to relayUrl: String) {
-        lock.lock()
-        let continuation = continuations[relayUrl]
-        lock.unlock()
-        continuation?.yield(frame)
-    }
-
-    /// Finish a relay's stream. The consumer drains any already-buffered frames
-    /// before exiting, so in-flight verified events are still delivered.
-    func finishPipeline(for relayUrl: String) {
-        lock.lock()
-        let continuation = continuations.removeValue(forKey: relayUrl)
-        tasks.removeValue(forKey: relayUrl)
-        lock.unlock()
-        continuation?.finish()
-    }
-
-    func finishAll() {
-        lock.lock()
-        let allContinuations = continuations
-        continuations.removeAll()
-        tasks.removeAll()
-        lock.unlock()
-        for continuation in allContinuations.values {
-            continuation.finish()
-        }
-    }
-}
-
-private enum ParsedInbound {
-    case event(subId: String, event: NostrEvent)
-    case ok(eventId: String, success: Bool, reason: String)
-    case eose(subscriptionId: String)
-    case notice(String)
-    
-    init?(_ message: URLSessionWebSocketTask.Message) {
-        guard let data = message.dataWithinInboundLimit,
-              let array = try? JSONSerialization.jsonObject(with: data) as? [Any],
-              array.count >= 2,
-              let type = array[0] as? String else {
-            return nil
-        }
-
-        switch type {
-        case "EVENT":
-            if array.count >= 3,
-               let subId = array[1] as? String,
-               let eventDict = array[2] as? [String: Any],
-               let event = try? NostrEvent(from: eventDict) {
-                self = .event(subId: subId, event: event)
-                return
-            }
-            return nil
-        case "EOSE":
-            if let subId = array[1] as? String {
-                self = .eose(subscriptionId: subId)
-                return
-            }
-            return nil
-        case "OK":
-            if array.count >= 3,
-               let eventId = array[1] as? String,
-               let success = array[2] as? Bool {
-                let reason = array.count >= 4 ? (array[3] as? String ?? "no reason given") : "no reason given"
-                self = .ok(eventId: eventId, success: success, reason: reason)
-                return
-            }
-            return nil
-        case "NOTICE":
-            if array.count >= 2, let msg = array[1] as? String {
-                self = .notice(msg)
-                return
-            }
-            return nil
-        default:
-            return nil
-        }
-    }
-}
-
-private extension URLSessionWebSocketTask.Message {
-    /// Prefer rejecting oversized frames before UTF-8/Data materialization
-    /// where we can (string length), and always before JSON parse.
-    var dataWithinInboundLimit: Data? {
-        let maxBytes = TransportConfig.nostrMaxInboundMessageBytes
-        switch self {
-        case .string(let text):
-            guard text.utf8.count <= maxBytes else { return nil }
-            return text.data(using: .utf8)
-        case .data(let data):
-            guard data.count <= maxBytes else { return nil }
-            return data
-        @unknown default:
-            return nil
-        }
-    }
-}
-
-// MARK: - Nostr Protocol Types
-
-enum NostrRequest: Encodable {
-    case event(NostrEvent)
-    case subscribe(id: String, filters: [NostrFilter])
-    case close(id: String)
-    
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.unkeyedContainer()
-        
-        switch self {
-        case .event(let event):
-            try container.encode("EVENT")
-            try container.encode(event)
-            
-        case .subscribe(let id, let filters):
-            try container.encode("REQ")
-            try container.encode(id)
-            for filter in filters {
-                try container.encode(filter)
-            }
-            
-        case .close(let id):
-            try container.encode("CLOSE")
-            try container.encode(id)
-        }
-    }
-}
-
-struct NostrFilter: Encodable {
-    var ids: [String]?
-    var authors: [String]?
-    var kinds: [Int]?
-    var since: Int?
-    var until: Int?
-    var limit: Int?
-    
-    // Tag filters - stored internally but encoded specially
-    fileprivate var tagFilters: [String: [String]]?
-    
-    init() {
-        // Default initializer
-    }
-    
-    // Custom encoding to handle tag filters properly
-    enum CodingKeys: String, CodingKey {
-        case ids, authors, kinds, since, until, limit
-    }
-    
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: DynamicCodingKey.self)
-        
-        // Encode standard fields
-        if let ids = ids { try container.encode(ids, forKey: DynamicCodingKey(stringValue: "ids")) }
-        if let authors = authors { try container.encode(authors, forKey: DynamicCodingKey(stringValue: "authors")) }
-        if let kinds = kinds { try container.encode(kinds, forKey: DynamicCodingKey(stringValue: "kinds")) }
-        if let since = since { try container.encode(since, forKey: DynamicCodingKey(stringValue: "since")) }
-        if let until = until { try container.encode(until, forKey: DynamicCodingKey(stringValue: "until")) }
-        if let limit = limit { try container.encode(limit, forKey: DynamicCodingKey(stringValue: "limit")) }
-        
-        // Encode tag filters with # prefix
-        if let tagFilters = tagFilters {
-            for (tag, values) in tagFilters {
-                try container.encode(values, forKey: DynamicCodingKey(stringValue: "#\(tag)"))
-            }
-        }
-    }
-    
-    // For NIP-17 gift wraps
-    static func giftWrapsFor(pubkey: String, since: Date? = nil) -> NostrFilter {
-        var filter = NostrFilter()
-        filter.kinds = [1059] // Gift wrap kind
-        filter.since = since?.timeIntervalSince1970.toInt()
-        filter.tagFilters = ["p": [pubkey]]
-        filter.limit = TransportConfig.nostrRelayDefaultFetchLimit // reasonable limit
-        return filter
-    }
-
-    // For location channels: geohash-scoped ephemeral events (kind 20000) and presence (kind 20001)
-    static func geohashEphemeral(_ geohash: String, since: Date? = nil, limit: Int = 1000) -> NostrFilter {
-        var filter = NostrFilter()
-        filter.kinds = [20000, 20001]
-        filter.since = since?.timeIntervalSince1970.toInt()
-        filter.tagFilters = ["g": [geohash]]
-        filter.limit = limit
-        return filter
-    }
-
-    // For location notes: persistent text notes (kind 1) tagged with geohash
-    static func geohashNotes(_ geohash: String, since: Date? = nil, limit: Int = 200) -> NostrFilter {
-        var filter = NostrFilter()
-        filter.kinds = [1]
-        filter.since = since?.timeIntervalSince1970.toInt()
-        filter.tagFilters = ["g": [geohash]]
-        filter.limit = limit
-        return filter
-    }
-
-    // For location notes with neighbors: subscribe to multiple geohashes (center + neighbors)
-    static func geohashNotes(_ geohashes: [String], since: Date? = nil, limit: Int = 200) -> NostrFilter {
-        var filter = NostrFilter()
-        filter.kinds = [1]
-        filter.since = since?.timeIntervalSince1970.toInt()
-        filter.tagFilters = ["g": geohashes]
-        filter.limit = limit
-        return filter
-    }
-
-    // For the mesh bridge: rendezvous messages (kind 20000) and presence
-    // (kind 20001) tagged `#r` with one or more cells (own + neighbors).
-    static func bridgeRendezvous(_ cells: [String], since: Date? = nil, limit: Int = 200) -> NostrFilter {
-        var filter = NostrFilter()
-        filter.kinds = [20000, 20001]
-        filter.since = since?.timeIntervalSince1970.toInt()
-        filter.tagFilters = ["r": cells]
-        filter.limit = limit
-        return filter
-    }
-
-    // For courier drops: sealed envelopes (kind 1401) parked under rotating
-    // recipient tags (`#x`, hex). Callers pass every candidate tag (adjacent
-    // UTC days x recipients) in one filter.
-    static func courierDrops(recipientTagsHex: [String], since: Date? = nil, limit: Int = 100) -> NostrFilter {
-        var filter = NostrFilter()
-        filter.kinds = [NostrProtocol.EventKind.courierDrop.rawValue]
-        filter.since = since?.timeIntervalSince1970.toInt()
-        filter.tagFilters = ["x": recipientTagsHex]
-        filter.limit = limit
-        return filter
-    }
-}
-
-// Dynamic coding key for tag filters
-private struct DynamicCodingKey: CodingKey {
-    var stringValue: String
-    var intValue: Int? { nil }
-    
-    init(stringValue: String) {
-        self.stringValue = stringValue
-    }
-    
-    init?(intValue: Int) {
-        return nil
-    }
-}
-
-private extension TimeInterval {
-    func toInt() -> Int {
-        return Int(self)
     }
 }

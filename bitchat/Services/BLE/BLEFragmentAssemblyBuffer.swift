@@ -58,18 +58,25 @@ struct BLEFragmentAssemblyBuffer {
         case stored(header: BLEFragmentHeader, started: Bool)
         case complete(header: BLEFragmentHeader, reassembledData: Data, started: Bool)
         case oversized(header: BLEFragmentHeader, projectedSize: Int, limit: Int, started: Bool)
+        case mismatched(header: BLEFragmentHeader, expectedTotal: Int, expectedOriginalType: UInt8)
     }
 
     private struct Metadata {
         let total: Int
+        let originalType: UInt8
         let timestamp: Date
         let isBroadcast: Bool
         var lastFragmentAt: Date
         var lastResyncRequestAt: Date?
+        var totalBytes: Int = 0
     }
 
     private var fragmentsByKey: [BLEFragmentKey: [Int: Data]] = [:]
     private var metadataByKey: [BLEFragmentKey: Metadata] = [:]
+
+    var isEmpty: Bool {
+        metadataByKey.isEmpty
+    }
 
     mutating func removeAll() {
         fragmentsByKey.removeAll()
@@ -78,6 +85,7 @@ struct BLEFragmentAssemblyBuffer {
 
     @discardableResult
     mutating func removeExpired(before cutoff: Date) -> Int {
+        guard !metadataByKey.isEmpty else { return 0 }
         let expiredKeys = metadataByKey
             .filter { $0.value.timestamp < cutoff }
             .map(\.key)
@@ -95,15 +103,34 @@ struct BLEFragmentAssemblyBuffer {
         maxInFlightAssemblies: Int,
         now: Date = Date()
     ) -> AppendResult {
-        let started = startAssemblyIfNeeded(for: header, maxInFlightAssemblies: maxInFlightAssemblies, now: now)
+        if let existingMetadata = metadataByKey[header.key] {
+            guard header.total == existingMetadata.total,
+                  header.originalType == existingMetadata.originalType,
+                  header.isBroadcastFragment == existingMetadata.isBroadcast,
+                  header.index >= 0,
+                  header.index < existingMetadata.total else {
+                // Reject conflicting header metadata without evicting the
+                // in-flight assembly so a spoofed fragment cannot force early
+                // completion or downgrade the assembly size limit.
+                return .mismatched(
+                    header: header,
+                    expectedTotal: existingMetadata.total,
+                    expectedOriginalType: existingMetadata.originalType
+                )
+            }
+        }
 
-        let held = fragmentsByKey[header.key]
-        let currentSize = held?.values.reduce(0) { $0 + $1.count } ?? 0
-        let limit = Self.assemblyLimit(for: header.originalType)
+        let started = startAssemblyIfNeeded(for: header, maxInFlightAssemblies: maxInFlightAssemblies, now: now)
+        guard let metadata = metadataByKey[header.key] else {
+            return .stored(header: header, started: started)
+        }
+
+        let currentSize = metadata.totalBytes
+        let limit = Self.assemblyLimit(for: metadata.originalType)
         // A re-delivered index replaces what it held rather than adding to
         // it: fragments bypass dedup and sync re-serves held indexes, so a
         // duplicate near the cap must not tip a valid assembly over it.
-        let replacedSize = held?[header.index]?.count ?? 0
+        let replacedSize = fragmentsByKey[header.key]?[header.index]?.count ?? 0
         let projectedSize = currentSize - replacedSize + header.fragmentData.count
 
         guard projectedSize <= limit else {
@@ -118,19 +145,23 @@ struct BLEFragmentAssemblyBuffer {
         // REQUEST_SYNC for a stalled stream.
         let isNewIndex = fragmentsByKey[header.key]?[header.index] == nil
         fragmentsByKey[header.key]?[header.index] = header.fragmentData
+        metadataByKey[header.key]?.totalBytes = projectedSize
         if isNewIndex {
             metadataByKey[header.key]?.lastFragmentAt = now
         }
 
         guard let fragments = fragmentsByKey[header.key],
-              fragments.count == header.total else {
+              fragments.count == metadata.total else {
             return .stored(header: header, started: started)
         }
 
-        let reassembled = (0..<header.total).reduce(into: Data()) { data, index in
-            if let fragment = fragments[index] {
-                data.append(fragment)
+        var reassembled = Data()
+        reassembled.reserveCapacity(projectedSize)
+        for index in 0..<metadata.total {
+            guard let fragment = fragments[index] else {
+                return .stored(header: header, started: started)
             }
+            reassembled.append(fragment)
         }
 
         fragmentsByKey.removeValue(forKey: header.key)
@@ -155,6 +186,7 @@ struct BLEFragmentAssemblyBuffer {
         fragmentsByKey[header.key] = [:]
         metadataByKey[header.key] = Metadata(
             total: header.total,
+            originalType: header.originalType,
             timestamp: now,
             isBroadcast: header.isBroadcastFragment,
             lastFragmentAt: now
