@@ -314,10 +314,6 @@ final class BLEService: NSObject {
     // 5. Fragment Reassembly (necessary for messages > MTU)
     private var fragmentAssemblyBuffer = BLEFragmentAssemblyBuffer()
     var outboundFragmentTransfers = BLEOutboundFragmentTransferScheduler()
-    /// bleQueue-confined tokens holding scanning paused while outbound
-    /// fragment trains are active, preventing overlapping transfers from
-    /// prematurely restarting scanning.
-    private var fragmentScanPauseTokens = Set<UUID>()
     lazy var privateMediaTransferAdmissions = BLEPrivateMediaTransferAdmissionRegistry { [weak self] transferId in
         self?.handlePrivateMediaAdmissionExpiry(transferId)
     }
@@ -449,6 +445,11 @@ final class BLEService: NSObject {
     var pendingPeripheralWrites = BLEOutboundWriteBuffer()
     // Debounce duplicate disconnect notifies
     private var disconnectNotifyDebouncer = BLEPeerEventDebouncer()
+    // Track recently verified direct announce messageIDs → owner peerID so a
+    // second unbound link carrying the identical verified announce (duplicate
+    // links to one phone) can still bind safely after dedup without ever
+    // binding on unverified announces. Engine-confined.
+    private var verifiedDirectAnnounceOwners = BoundedCache<String, PeerID>(capacity: 256, ttl: 60)
     // Store-and-forward for directed messages when we have no links
     private var pendingDirectedRelays = BLEDirectedRelaySpool()
     // Debounce for 'reconnected' logs
@@ -780,6 +781,7 @@ final class BLEService: NSObject {
             fragmentAssemblyBuffer.removeAll()
             pendingDirectedRelays.removeAll()
             ingressLinks.removeAll()
+            verifiedDirectAnnounceOwners.removeAll()
             recentTrafficTracker.removeAll()
             scheduledRelays.cancelAll()
             // Proofs and revalidation epochs die with the identity; the
@@ -909,7 +911,7 @@ final class BLEService: NSObject {
     }
 
     private func markSelfBroadcastProcessed(_ packet: BitchatPacket) {
-        messageDeduplicator.markProcessed(BLESelfBroadcastTracker.dedupID(for: packet))
+        messageDeduplicator.markProcessed(BLEIngressLinkRegistry.messageID(for: packet))
     }
     
     // MARK: - Transport Protocol Conformance
@@ -1123,6 +1125,7 @@ final class BLEService: NSObject {
             maintenanceTimer?.cancel()
             maintenanceTimer = nil
             radio.stopDutyCycle()
+            radio.cancelFragmentScanPauses()
         }
 
         centralManager?.stopScan()
@@ -1551,9 +1554,15 @@ final class BLEService: NSObject {
         messageQueue.async { [weak self] in
             guard let self = self else { return }
 
+            let pauseToken = self.outboundFragmentTransfers.scanPauseToken(for: transferId)
             switch self.outboundFragmentTransfers.cancelTransfer(transferId) {
             case let .active(id, workItems):
                 workItems.forEach { $0.cancel() }
+                if let pauseToken {
+                    self.bleQueue.async { [weak self] in
+                        self?.radio.endFragmentScanPause(token: pauseToken)
+                    }
+                }
                 TransferProgressManager.shared.cancel(id: transferId)
                 SecureLogger.debug("🛑 Cancelled transfer \(id.prefix(8))…", category: .session)
                 self.messageQueue.async { [weak self] in
@@ -1956,6 +1965,8 @@ final class BLEService: NSObject {
         case .failure(.directSenderMismatch(let boundPeerID, let claimedSenderID)):
             SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! \(linkDescription) claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(boundPeerID.id.prefix(8))…", category: .security)
             return nil
+        case .failure(.foreignRequestSync):
+            return nil
         case .failure(.invalidRSR(let peerID)):
             SecureLogger.warning("Invalid or unsolicited RSR packet from \(peerID.id.prefix(8))… - rejecting", category: .security)
             return nil
@@ -1984,7 +1995,7 @@ final class BLEService: NSObject {
         case .failure(.timestampSkew(let peerID, let skewMs, let maxSkewMs)):
             SecureLogger.warning("Packet timestamp skewed by \(skewMs)ms (max \(maxSkewMs)ms) from \(peerID.id.prefix(8))…", category: .security)
             return false
-        case .failure(.selfLoopback), .failure(.directSenderMismatch):
+        case .failure(.selfLoopback), .failure(.directSenderMismatch), .failure(.foreignRequestSync):
             return false
         }
     }
@@ -2021,7 +2032,9 @@ final class BLEService: NSObject {
         _ packet: BitchatPacket,
         transferId: String? = nil,
         requiresPrivateMediaAdmission: Bool = false,
-        precomputedMessageID: String? = nil
+        precomputedMessageID: String? = nil,
+        extraExcludedPeerID: PeerID? = nil,
+        spoolEnqueuedAt: Date? = nil
     ) {
         guard !isPanicSuspended else {
             if requiresPrivateMediaAdmission, let transferId {
@@ -2045,6 +2058,9 @@ final class BLEService: NSObject {
         } else {
             packetToSend = packet
         }
+        let originatedFirstHop: PeerID? = (packetToSend.senderID == myPeerIDData)
+            ? packetToSend.route?.first.flatMap(routingPeer(from:))
+            : nil
 
         // Encode once using a small per-type padding policy, then delegate by type
         let padForBLE = BLEOutboundPacketPolicy.padsBLEFrame(for: packetToSend.type)
@@ -2069,15 +2085,11 @@ final class BLEService: NSObject {
         if let transferId,
            let recipientPeerID = PeerID(hexData: packetToSend.recipientID),
            packetToSend.type == MessageType.fileTransfer.rawValue {
-            let compatibilityRequest = BLEOutboundFragmentTransferRequest(
+            guard let plan = BLEOutboundFragmentPlanner.makePlan(
                 packet: packetToSend,
                 pad: padForBLE,
                 maxChunk: nil,
                 directedPeer: recipientPeerID,
-                transferId: transferId
-            )
-            guard let plan = BLEOutboundFragmentPlanner.makePlan(
-                for: compatibilityRequest,
                 defaultChunkSize: defaultFragmentSize,
                 bleMaxMTU: bleMaxMTU
             ), BLEOutboundFragmentPlanner.isPrivateMediaV1Compatible(plan) else {
@@ -2122,7 +2134,7 @@ final class BLEService: NSObject {
                 packetToSend,
                 pad: padForBLE,
                 maxChunk: nil,
-                directedOnlyPeer: nil,
+                directedOnlyPeer: originatedFirstHop,
                 transferId: transferId,
                 requiresPrivateMediaAdmission: requiresPrivateMediaAdmission
             )
@@ -2138,7 +2150,7 @@ final class BLEService: NSObject {
                 packetToSend,
                 pad: padForBLE,
                 maxChunk: nil,
-                directedOnlyPeer: recipientPeerID,
+                directedOnlyPeer: originatedFirstHop ?? recipientPeerID,
                 transferId: transferId,
                 requiresPrivateMediaAdmission: requiresPrivateMediaAdmission
             )
@@ -2159,33 +2171,58 @@ final class BLEService: NSObject {
             return
         }
         if packetToSend.type == MessageType.noiseEncrypted.rawValue {
-            sendEncrypted(packetToSend, data: data, pad: padForBLE, precomputedMessageID: precomputedMessageID)
+            sendEncrypted(
+                packetToSend,
+                data: data,
+                pad: padForBLE,
+                originatedFirstHop: originatedFirstHop,
+                precomputedMessageID: precomputedMessageID,
+                extraExcludedPeerID: extraExcludedPeerID,
+                spoolEnqueuedAt: spoolEnqueuedAt
+            )
             return
         }
-        sendGenericBroadcast(packetToSend, data: data, pad: padForBLE, precomputedMessageID: precomputedMessageID)
+        sendGenericBroadcast(
+            packetToSend,
+            data: data,
+            pad: padForBLE,
+            directedOnlyPeer: originatedFirstHop,
+            precomputedMessageID: precomputedMessageID,
+            extraExcludedPeerID: extraExcludedPeerID,
+            spoolEnqueuedAt: spoolEnqueuedAt
+        )
     }
 
-    private func sendEncrypted(_ packet: BitchatPacket, data: Data, pad: Bool, precomputedMessageID: String? = nil) {
+    private func sendEncrypted(
+        _ packet: BitchatPacket,
+        data: Data,
+        pad: Bool,
+        originatedFirstHop: PeerID? = nil,
+        precomputedMessageID: String? = nil,
+        extraExcludedPeerID: PeerID? = nil,
+        spoolEnqueuedAt: Date? = nil
+    ) {
         guard let recipientPeerID = PeerID(hexData: packet.recipientID) else { return }
+        let linkTargetPeerID = originatedFirstHop ?? recipientPeerID
         var sentEncrypted = false
 
         let outboundPriority = BLEOutboundPacketPolicy.priority(for: packet, data: data)
 
         // Per-link limits for the specific peer (single bleQueue.sync hop)
-        let directLinks = snapshotDirectLinks(for: recipientPeerID)
+        let directLinks = snapshotDirectLinks(for: linkTargetPeerID)
         let directPeripheralState = directLinks.peripheralState
         let recipientCentral = directLinks.central
 
         if let peripheralMaxLen = directPeripheralState?.peripheral.maximumWriteValueLength(for: .withoutResponse),
            data.count > peripheralMaxLen {
             let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(forLinkLimit: peripheralMaxLen)
-            sendFragmentedPacket(packet, pad: pad, maxChunk: chunk, directedOnlyPeer: recipientPeerID)
+            sendFragmentedPacket(packet, pad: pad, maxChunk: chunk, directedOnlyPeer: linkTargetPeerID)
             return
         }
         if let centralMaxLen = recipientCentral?.maximumUpdateValueLength,
            data.count > centralMaxLen {
             let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(forLinkLimit: centralMaxLen)
-            sendFragmentedPacket(packet, pad: pad, maxChunk: chunk, directedOnlyPeer: recipientPeerID)
+            sendFragmentedPacket(packet, pad: pad, maxChunk: chunk, directedOnlyPeer: linkTargetPeerID)
             return
         }
 
@@ -2219,19 +2256,31 @@ final class BLEService: NSObject {
                 packet: packet,
                 data: data,
                 pad: pad,
-                directedOnlyPeer: recipientPeerID,
-                precomputedMessageID: precomputedMessageID
+                directedOnlyPeer: linkTargetPeerID,
+                precomputedMessageID: precomputedMessageID,
+                extraExcludedPeerID: extraExcludedPeerID,
+                spoolEnqueuedAt: spoolEnqueuedAt
             )
         }
     }
 
-    private func sendGenericBroadcast(_ packet: BitchatPacket, data: Data, pad: Bool, precomputedMessageID: String? = nil) {
+    private func sendGenericBroadcast(
+        _ packet: BitchatPacket,
+        data: Data,
+        pad: Bool,
+        directedOnlyPeer: PeerID? = nil,
+        precomputedMessageID: String? = nil,
+        extraExcludedPeerID: PeerID? = nil,
+        spoolEnqueuedAt: Date? = nil
+    ) {
         sendOnAllLinks(
             packet: packet,
             data: data,
             pad: pad,
-            directedOnlyPeer: nil,
-            precomputedMessageID: precomputedMessageID
+            directedOnlyPeer: directedOnlyPeer,
+            precomputedMessageID: precomputedMessageID,
+            extraExcludedPeerID: extraExcludedPeerID,
+            spoolEnqueuedAt: spoolEnqueuedAt
         )
     }
 
@@ -2360,7 +2409,9 @@ final class BLEService: NSObject {
         directedOnlyPeer: PeerID?,
         requireDirectPeerLink: Bool = false,
         requireNoiseAuthenticatedPeerLink: Bool = false,
-        precomputedMessageID: String? = nil
+        precomputedMessageID: String? = nil,
+        extraExcludedPeerID: PeerID? = nil,
+        spoolEnqueuedAt: Date? = nil
     ) -> Bool {
         guard !isPanicSuspended else { return false }
 
@@ -2388,21 +2439,41 @@ final class BLEService: NSObject {
                        selectedLinks: emptySelection,
                        packetType: packet.type
                    ) {
-                    spoolDirectedPacket(packet, recipientPeerID: only, precomputedMessageID: precomputedMessageID)
+                    spoolDirectedPacket(
+                        packet,
+                        recipientPeerID: only,
+                        precomputedMessageID: precomputedMessageID,
+                        enqueuedAt: spoolEnqueuedAt ?? Date(),
+                        ingressPeerID: extraExcludedPeerID
+                    )
                 }
             }
             return false
         }
 
         let ingressRecord: BLEIngressLinkRecord?
+        let allIngressLinks: Set<BLEIngressLinkID>
+        let allIngressPeers: Set<PeerID>
         if ingressLinks.isEmpty {
             ingressRecord = nil
+            allIngressLinks = []
+            allIngressPeers = []
         } else if let precomputedMessageID {
             ingressRecord = ingressLinks.record(forMessageID: precomputedMessageID)
+            allIngressLinks = ingressLinks.allLinks(forMessageID: precomputedMessageID)
+            allIngressPeers = ingressLinks.allPeerIDs(forMessageID: precomputedMessageID)
         } else {
             ingressRecord = ingressLinks.record(for: packet)
+            allIngressLinks = ingressLinks.allLinks(for: packet)
+            allIngressPeers = ingressLinks.allPeerIDs(for: packet)
         }
-        var excludedPeerLinks = links(to: ingressRecord?.peerID)
+        var excludedPeerLinks = allIngressLinks
+        for ingressPeer in allIngressPeers {
+            excludedPeerLinks.formUnion(links(to: ingressPeer))
+        }
+        if let extraExcludedPeerID {
+            excludedPeerLinks.formUnion(links(to: extraExcludedPeerID))
+        }
         if requireNoiseAuthenticatedPeerLink {
             guard let directedOnlyPeer else { return false }
             let boundLinks = links(to: directedOnlyPeer)
@@ -2453,7 +2524,13 @@ final class BLEService: NSObject {
         // If directed and we currently have no links to forward on, spool for a short window
         if let only = plan.directedPeerHint,
            plan.shouldSpoolDirectedPacket {
-            spoolDirectedPacket(packet, recipientPeerID: only, precomputedMessageID: precomputedMessageID)
+            spoolDirectedPacket(
+                packet,
+                recipientPeerID: only,
+                precomputedMessageID: precomputedMessageID,
+                enqueuedAt: spoolEnqueuedAt ?? Date(),
+                ingressPeerID: extraExcludedPeerID ?? ingressRecord?.peerID
+            )
         }
 
         var acceptedByPhysicalLink = false
@@ -2526,14 +2603,21 @@ final class BLEService: NSObject {
     }
 
     // MARK: - Directed store-and-forward
-    private func spoolDirectedPacket(_ packet: BitchatPacket, recipientPeerID: PeerID, precomputedMessageID: String? = nil) {
+    private func spoolDirectedPacket(
+        _ packet: BitchatPacket,
+        recipientPeerID: PeerID,
+        precomputedMessageID: String? = nil,
+        enqueuedAt: Date = Date(),
+        ingressPeerID: PeerID? = nil
+    ) {
         let msgID = precomputedMessageID ?? BLEOutboundPacketPolicy.messageID(for: packet)
         onEngine {
             if self.pendingDirectedRelays.enqueue(
                 packet: packet,
                 recipient: recipientPeerID,
                 messageID: msgID,
-                enqueuedAt: Date()
+                enqueuedAt: enqueuedAt,
+                ingressPeerID: ingressPeerID
             ) {
                 SecureLogger.debug("🧳 Spooling directed packet for \(recipientPeerID) mid=\(msgID.prefix(8))…", category: .session)
             }
@@ -2544,7 +2628,8 @@ final class BLEService: NSObject {
         guard !isPanicSuspended else { return }
         // Runs from bleQueue maintenance: hop to the engine asynchronously
         // (bleQueue must never sync-wait on the engine). Move items out and
-        // attempt broadcast; if still no links, they'll be re-spooled.
+        // attempt broadcast; if still no links, they'll be re-spooled with
+        // their original timestamp and ingress peer preserved.
         messageQueue.async { [weak self] in
             guard let self, !self.isPanicSuspended else { return }
             let toSend = self.pendingDirectedRelays.drainUnexpired(
@@ -2552,7 +2637,11 @@ final class BLEService: NSObject {
                 window: TransportConfig.bleDirectedSpoolWindowSeconds
             )
             for entry in toSend {
-                self.broadcastPacket(entry.packet)
+                self.broadcastPacket(
+                    entry.packet,
+                    extraExcludedPeerID: entry.ingressPeerID,
+                    spoolEnqueuedAt: entry.enqueuedAt
+                )
             }
         }
     }
@@ -2689,8 +2778,8 @@ final class BLEService: NSObject {
             trackPacketSeen: { [weak self] packet in
                 self?.gossipSyncManager?.onPublicPacketSeen(packet)
             },
-            enforceStorageQuota: { [weak self] reservingBytes in
-                self?.incomingFileStore.enforceQuota(reservingBytes: reservingBytes)
+            enforceStorageQuota: { [weak self] reservingBytes, isPrivate in
+                self?.incomingFileStore.enforceQuota(reservingBytes: reservingBytes, isPrivate: isPrivate)
             },
             saveIncomingFile: { [weak self] data, preferredName, subdirectory, fallbackExtension, defaultPrefix in
                 self?.incomingFileStore.save(
@@ -3637,7 +3726,19 @@ extension BLEService {
     #endif
     
     // MARK: Private Message Handling
-    
+
+    private func reportPrivateMessageEncodingFailure(content: String, messageID: String) {
+        let reason = PrivateMessagePacket.contentFitsOnWire(content)
+            ? String(localized: "content.delivery.reason.send_error", comment: "Failure reason for a generic send error")
+            : String(localized: "content.delivery.reason.too_long", defaultValue: "message too long", comment: "Failure reason when a private message exceeds the wire size limit")
+        notifyUI { [weak self] in
+            self?.deliverTransportEvent(.messageDeliveryStatusUpdated(
+                messageID: messageID,
+                status: .failed(reason: reason)
+            ))
+        }
+    }
+
     private func sendPrivateMessage(_ content: String, to recipientID: PeerID, messageID: String) {
         // Hop like sendMessage: the Transport-facing wrappers call this from
         // the main actor (router sends, favorite notifications), and the send
@@ -3653,12 +3754,19 @@ extension BLEService {
         let recipientID = recipientID.toShort()
         SecureLogger.debug("📨 Sending PM to \(recipientID.id.prefix(8))… id=\(messageID.prefix(8))… chars=\(content.count) bytes=\(content.utf8.count)", category: .session)
 
+        guard PrivateMessagePacket.contentFitsOnWire(content) else {
+            SecureLogger.error("Private message is \(content.utf8.count) UTF-8 bytes; the wire limit is \(PrivateMessagePacket.maxContentUTF8Bytes)", category: .session)
+            reportPrivateMessageEncodingFailure(content: content, messageID: messageID)
+            return
+        }
+
         // Check if we have an established Noise session
         if noiseService.hasEstablishedSession(with: recipientID) {
             // Encrypt and send
             do {
                 guard let messagePayload = BLENoisePayloadFactory.privateMessage(content: content, messageID: messageID) else {
                     SecureLogger.error("Failed to encode private message with TLV")
+                    reportPrivateMessageEncodingFailure(content: content, messageID: messageID)
                     return
                 }
                 
@@ -3783,7 +3891,7 @@ extension BLEService {
                 // Use the same TLV format as normal sends to keep receiver decoding consistent
                 guard let messagePayload = BLENoisePayloadFactory.privateMessage(content: message.content, messageID: message.messageID) else {
                     SecureLogger.error("Failed to encode pending private message TLV")
-                    failedMessages.append(message)
+                    reportPrivateMessageEncodingFailure(content: message.content, messageID: message.messageID)
                     continue
                 }
 
@@ -3912,7 +4020,14 @@ extension BLEService {
             guard let self = self else { return }
             TransferProgressManager.shared.cancel(id: id)
             messageQueue.async { [weak self] in
-                _ = self?.outboundFragmentTransfers.releaseReservation(id)
+                guard let self else { return }
+                let pauseToken = self.outboundFragmentTransfers.scanPauseToken(for: id)
+                if self.outboundFragmentTransfers.releaseReservation(id) != nil,
+                   let pauseToken {
+                    self.bleQueue.async { [weak self] in
+                        self?.radio.endFragmentScanPause(token: pauseToken)
+                    }
+                }
             }
             self.messageQueue.async { [weak self] in
                 self?.startNextPendingTransferIfNeeded()
@@ -3930,35 +4045,30 @@ extension BLEService {
             return false
         }
 
-        // Lightweight pacing to reduce floods and allow BLE buffers to drain
-        // Also pause scanning during long fragment trains to save battery and
-        // keep it paused until overlapping transfers finish.
-        if plan.shouldPauseScanning {
-            let pauseToken = UUID()
-            let totalFragments = plan.totalFragments
-            let expectedMs = min(TransportConfig.bleExpectedWriteMaxMs, totalFragments * TransportConfig.bleExpectedWritePerFragmentMs)
-            bleQueue.async { [weak self] in
-                guard let self = self, let c = self.centralManager, c.state == .poweredOn else { return }
-                self.fragmentScanPauseTokens.insert(pauseToken)
-                if c.isScanning { c.stopScan() }
-                self.bleQueue.asyncAfter(deadline: .now() + .milliseconds(expectedMs)) { [weak self] in
-                    guard let self else { return }
-                    self.fragmentScanPauseTokens.remove(pauseToken)
-                    if self.fragmentScanPauseTokens.isEmpty {
-                        self.radio.startScanning()
-                    }
-                }
-            }
-        }
+        // Lightweight pacing to reduce floods and allow BLE buffers to drain.
+        // Pause scanning during long fragment trains to save battery and keep
+        // it paused via BLERadioController until overlapping transfers finish.
+        let pauseToken: UUID? = plan.shouldPauseScanning ? UUID() : nil
+        let pauseDuration = Double(min(
+            TransportConfig.bleExpectedWriteMaxMs,
+            plan.totalFragments * TransportConfig.bleExpectedWritePerFragmentMs
+        )) / 1_000.0
 
         let transferIdentifier: String?
         if let id = reservedTransferId {
-            let activated = onEngine {
-                self.outboundFragmentTransfers.activateReservedTransfer(
+            let activated: Bool = onEngine {
+                let didActivate = self.outboundFragmentTransfers.activateReservedTransfer(
                     id: id,
                     totalFragments: plan.totalFragments,
-                    workItems: []
+                    workItems: [],
+                    scanPauseToken: pauseToken
                 )
+                if didActivate, let pauseToken {
+                    self.bleQueue.async { [weak self] in
+                        self?.radio.beginFragmentScanPause(token: pauseToken, duration: pauseDuration)
+                    }
+                }
+                return didActivate
             }
             // Cancellation may remove the reservation between submit and plan
             // construction. Treat that as cancellation, not as permission to
@@ -3967,6 +4077,11 @@ extension BLEService {
             TransferProgressManager.shared.start(id: id, totalFragments: plan.totalFragments)
             transferIdentifier = id
         } else {
+            if let pauseToken {
+                bleQueue.async { [weak self] in
+                    self?.radio.beginFragmentScanPause(token: pauseToken, duration: pauseDuration)
+                }
+            }
             transferIdentifier = nil
         }
 
@@ -3979,6 +4094,9 @@ extension BLEService {
                     requireDirectPeerLink: true,
                     requireNoiseAuthenticatedPeerLink: request.requireNoiseAuthenticatedPeerLink
                 )
+            }
+            if let route = request.packet.route, !route.isEmpty, let nextHop = request.directedPeer {
+                return self.sendPacketDirected(fragmentPacket, to: nextHop)
             }
             self.broadcastPacket(fragmentPacket)
             return true
@@ -4047,6 +4165,7 @@ extension BLEService {
         messageQueue.async { [weak self] in
             guard let self = self else { return }
 
+            let pauseToken = self.outboundFragmentTransfers.scanPauseToken(for: transferId)
             switch self.outboundFragmentTransfers.markFragmentSent(transferId: transferId) {
             case .progress, .complete:
                 TransferProgressManager.shared.recordFragmentSent(id: transferId)
@@ -4056,11 +4175,9 @@ extension BLEService {
             }
 
             if !self.outboundFragmentTransfers.isActive(transferId) {
-                if self.outboundFragmentTransfers.activeCount == 0 && self.outboundFragmentTransfers.pendingCount == 0 {
+                if let pauseToken {
                     self.bleQueue.async { [weak self] in
-                        guard let self, !self.fragmentScanPauseTokens.isEmpty else { return }
-                        self.fragmentScanPauseTokens.removeAll()
-                        self.radio.startScanning()
+                        self?.radio.endFragmentScanPause(token: pauseToken)
                     }
                 }
                 self.messageQueue.async { [weak self] in
@@ -4082,12 +4199,12 @@ extension BLEService {
         }
     }
     
-    private func handleFragment(_ packet: BitchatPacket, from peerID: PeerID) -> Bool {
+    private func handleFragment(_ packet: BitchatPacket, from peerID: PeerID, receivedFrom: PeerID? = nil) -> Bool {
         if DispatchQueue.getSpecific(key: messageQueueKey) != nil {
-            return fragmentHandler.handle(packet, from: peerID)
+            return fragmentHandler.handle(packet, from: peerID, receivedFrom: receivedFrom)
         } else {
             return onEngine {
-                fragmentHandler.handle(packet, from: peerID)
+                fragmentHandler.handle(packet, from: peerID, receivedFrom: receivedFrom)
             }
         }
     }
@@ -4269,25 +4386,29 @@ extension BLEService {
             SecureLogger.debug("📦 Decoded packet type: \(packet.type) from sender: \(claimedSenderID.id.prefix(8))… (\(linkDescription))", category: .session)
         }
 
-        if packet.type == MessageType.announce.rawValue,
-           packet.ttl == messageTTL {
-            // Raw announces only bind unbound links: this runs before
-            // signature verification, so a bound link must not be re-bound
-            // by a raw announce (spoofable).
-            let boundPeerID = linkBindings.boundPeer(for: link)
-            if boundPeerID == nil || boundPeerID == claimedSenderID {
-                switch link {
-                case .peripheral(let peripheralUUID):
-                    bindPeripheralLink(peripheralUUID, to: claimedSenderID)
-                case .central(let centralUUID):
-                    linkBindings.bindCentral(centralUUID, to: claimedSenderID)
-                }
-                refreshLocalTopology()
-            }
-        }
-
         let messageID = BLEIngressLinkRegistry.messageID(for: packet)
+        let priorIngressPeers = ingressLinks.allPeerIDs(forMessageID: messageID)
         guard recordIngressIfNew(messageID: messageID, link: link, peerID: context.receivedFromPeerID) else {
+            // A duplicate copy of an already signature-verified direct announce
+            // arriving on a second unbound link (e.g. dual links to one phone)
+            // may bind that unbound link safely; unverified announces never
+            // enter `verifiedDirectAnnounceOwners` and never bind any link.
+            if packet.type == MessageType.announce.rawValue,
+               packet.ttl == messageTTL,
+               linkBindings.boundPeer(for: link) == nil,
+               verifiedDirectAnnounceOwners.value(for: messageID, now: Date()) == claimedSenderID {
+                bindUnboundLinkAfterVerifiedDirectAnnounce(link, to: claimedSenderID)
+            }
+            // Broadcast duplicate suppression: if a distinct neighbor already
+            // relayed this broadcast while our own relay is waiting in its
+            // jitter window, cancel our scheduled relay in dense graphs.
+            // Fragments and directed packets are excluded.
+            if packet.type != MessageType.fragment.rawValue,
+               BLEPacketFreshnessPolicy.isBroadcastRecipient(packet.recipientID),
+               !priorIngressPeers.contains(context.receivedFromPeerID),
+               BLEReceivePipeline.shouldCancelScheduledRelayForDuplicate(connectedPeerCount: peerRegistry.connectedCount) {
+                scheduledRelays.cancel(messageID: messageID)
+            }
             return
         }
 
@@ -4364,7 +4485,11 @@ extension BLEService {
             SecureLogger.debug("📦 Handling packet type \(packet.type) from \(senderID.id.prefix(8))…, messageID: \(messageID.prefix(24))…", category: .session)
         }
         
-        if dropDuplicatePacketIfNeeded(context: context, messageID: messageID) { return }
+        if dropDuplicatePacketIfNeeded(
+            context: context,
+            messageID: messageID,
+            isBroadcast: BLEPacketFreshnessPolicy.isBroadcastRecipient(packet.recipientID)
+        ) { return }
         
         // Update peer info without verbose logging - update the peer we received from, not the original sender
         updatePeerLastSeen(peerID)
@@ -4419,7 +4544,7 @@ extension BLEService {
             handleNoiseEncrypted(packet, from: senderID)
             
         case .fragment:
-            guard handleFragment(packet, from: senderID) else { return }
+            guard handleFragment(packet, from: senderID, receivedFrom: peerID) else { return }
             
         case .fileTransfer:
             // Broadcast files that fail sender authentication must not spread
@@ -4431,7 +4556,7 @@ extension BLEService {
             handleCourierEnvelope(packet, from: peerID)
 
         case .groupMessage:
-            handleGroupMessage(packet, from: senderID)
+            guard handleGroupMessage(packet, from: senderID) else { return }
 
         case .prekeyBundle:
             guard handlePrekeyBundle(packet, from: senderID) else { return }
@@ -4462,10 +4587,10 @@ extension BLEService {
             guard handleLeave(packet, from: senderID) else { return }
 
         case .none:
-            // Unknown/future wire types stay relayable (subject to dedup,
-            // TTL clamp, and PacketPayloadLimits's default cap) for
-            // forward compatibility with newer iOS/Android clients.
-            SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)
+            // Drop unrecognized wire types instead of blindly relaying up to
+            // the default 128 KiB payload limit with no authentication.
+            SecureLogger.warning("⚠️ Dropping unknown message type: \(packet.type)", category: .session)
+            return
         }
         
         if forwardAlongRouteIfNeeded(packet) {
@@ -4475,7 +4600,11 @@ extension BLEService {
         scheduleRelayIfNeeded(packet, senderID: senderID, messageID: messageID)
     }
 
-    private func dropDuplicatePacketIfNeeded(context: BLEReceivedPacketContext, messageID: String) -> Bool {
+    private func dropDuplicatePacketIfNeeded(
+        context: BLEReceivedPacketContext,
+        messageID: String,
+        isBroadcast: Bool
+    ) -> Bool {
         guard context.shouldDeduplicate, messageDeduplicator.isDuplicate(messageID) else {
             return false
         }
@@ -4485,7 +4614,8 @@ extension BLEService {
         }
 
         let connectedCount = peerRegistry.connectedCount
-        if BLEReceivePipeline.shouldCancelScheduledRelayForDuplicate(connectedPeerCount: connectedCount) {
+        if isBroadcast,
+           BLEReceivePipeline.shouldCancelScheduledRelayForDuplicate(connectedPeerCount: connectedCount) {
             scheduledRelays.cancel(messageID: messageID)
         }
 
@@ -4523,13 +4653,38 @@ extension BLEService {
             return false
         }
 
+        // Peers advertising PeerCapabilities (TLV 0x05) necessarily speak v2
+        // BinaryProtocol (capabilities shipped after v2 framing). Recording v2
+        // here lets source routing activate on verified announces without
+        // switching announce packets to v2 (which v1-only clients would drop).
+        if result.announcement.capabilities != nil {
+            meshTopology.recordObservedVersion(2, for: result.peerID.routingData)
+        }
+
+        // A verified direct announce proves the sender owns the link it came
+        // in on: bind an unbound link (deferred until after signature/trust
+        // verification so unverified announces can never hijack a peer's
+        // preferred link), heal any stale binding left by a peer-ID rotation,
+        // and consolidate duplicate same-role connections onto that link.
+        if result.isDirectAnnounce {
+            let messageID = BLEIngressLinkRegistry.messageID(for: packet)
+            verifiedDirectAnnounceOwners.set(messageID, value: result.peerID, now: Date())
+            rebindLinkAfterVerifiedDirectAnnounce(packet, to: result.peerID)
+            retireRedundantPeripheralLinks(packet, to: result.peerID)
+        }
+
         // A capability bit in the public announce is only a discovery hint.
         // Start authentication promptly for a directly connected candidate,
-        // but never pin or pre-queue private bytes until encrypted 0x21 state
-        // arrives from the completed Noise session.
+        // but never pin private-media capability or trust prekey bundles until
+        // encrypted 0x21 state arrives from the completed Noise session.
+        let needsPrivateMediaProof = result.announcement.capabilities?.contains(.privateMedia) == true
+            && privateMediaSendPolicy(to: result.peerID) == .awaitingCapabilityProof
+        let needsPrekeySigningProof = result.announcement.capabilities?.contains(.prekeys) == true
+            && identityManager.authenticatedSigningPublicKey(
+                forFingerprint: result.announcement.noisePublicKey.sha256Fingerprint()
+            ) == nil
         if result.isDirectAnnounce,
-           result.announcement.capabilities?.contains(.privateMedia) == true,
-           privateMediaSendPolicy(to: result.peerID) == .awaitingCapabilityProof,
+           (needsPrivateMediaProof || needsPrekeySigningProof),
            !noiseService.hasSession(with: result.peerID) {
             initiateNoiseHandshake(with: result.peerID)
         }
@@ -4537,14 +4692,6 @@ extension BLEService {
         // A verified announce is the moment a signing key becomes bound to this
         // owner's noise key: retry any prekey bundle that raced ahead of it.
         drainPendingPrekeyBundles(for: result.peerID)
-
-        // A verified direct announce proves the sender owns the link it came
-        // in on: heal any stale binding left by a peer-ID rotation, and
-        // consolidate duplicate same-role connections onto that link.
-        if result.isDirectAnnounce {
-            rebindLinkAfterVerifiedDirectAnnounce(packet, to: result.peerID)
-            retireRedundantPeripheralLinks(packet, to: result.peerID)
-        }
 
         // Bridge courier watch: a verified announce may add a peer whose
         // relay-parked drops we should start watching for.
@@ -4595,6 +4742,33 @@ extension BLEService {
     /// retirement — is one engine slot, so no observer can see a
     /// half-applied rotation. Only the physical connection cancels hop to
     /// bleQueue.
+    /// Binds a previously unbound link only after the direct announce it
+    /// carried passed full signature and trust-policy verification. Refuses to
+    /// overwrite `preferredPeripheral` when `peerID` already owns a different
+    /// Noise-authenticated peripheral link. Engine-confined.
+    private func bindUnboundLinkAfterVerifiedDirectAnnounce(_ link: BLEIngressLinkID, to peerID: PeerID) {
+        switch link {
+        case .peripheral(let peripheralUUID):
+            let hasOtherAuthenticatedPeripheral = linkAuth.links(ownedBy: peerID).contains { existingLink in
+                guard case .peripheral(let existingUUID) = existingLink, existingUUID != peripheralUUID else {
+                    return false
+                }
+                return linkBindings.peer(forPeripheralID: existingUUID) == peerID
+            }
+            guard !hasOtherAuthenticatedPeripheral else {
+                SecureLogger.warning(
+                    "🚫 Refusing unbound peripheral bind to \(peerID.id.prefix(8))…: peer already owns a Noise-authenticated peripheral link",
+                    category: .security
+                )
+                return
+            }
+            bindPeripheralLink(peripheralUUID, to: peerID)
+        case .central(let centralUUID):
+            linkBindings.bindCentral(centralUUID, to: peerID)
+        }
+        refreshLocalTopology()
+    }
+
     private func rebindLinkAfterVerifiedDirectAnnounce(_ packet: BitchatPacket, to peerID: PeerID) {
         guard let link = ingressLinks.link(for: packet) else { return }
         let linkUUID: String
@@ -4607,7 +4781,14 @@ extension BLEService {
             linkUUID = centralUUID
             previousPeerID = linkBindings.peer(forCentralUUID: centralUUID)
         }
-        guard let previousPeerID else { return }
+        guard let previousPeerID else {
+            bindUnboundLinkAfterVerifiedDirectAnnounce(link, to: peerID)
+            refreshNoiseSessionForVerifiedDirectLink(
+                link: link,
+                peerID: peerID
+            )
+            return
+        }
         guard previousPeerID != peerID else {
             refreshNoiseSessionForVerifiedDirectLink(
                 link: link,
@@ -5024,6 +5205,11 @@ extension BLEService {
 
     // Handle REQUEST_SYNC: decode payload and respond with missing packets via sync manager
     private func handleRequestSync(_ packet: BitchatPacket, from peerID: PeerID) {
+        if let recipientID = packet.recipientID,
+           !BLEPacketFreshnessPolicy.isBroadcastRecipient(recipientID),
+           recipientID != myPeerIDData {
+            return
+        }
         // REQUEST_SYNC is link-local by design (always sent with ttl 0): a
         // nonzero TTL means a crafted or relayed request, and answering one
         // would let a single small packet fan a full store replay out of
@@ -5065,6 +5251,9 @@ extension BLEService {
             localPeerID: { [weak self] in
                 self?.myPeerID ?? PeerID(str: "")
             },
+            localSigningPublicKey: { [weak self] in
+                self?.noiseService.getSigningPublicKeyData()
+            },
             localNickname: { [weak self] in
                 self?.myNickname ?? ""
             },
@@ -5103,13 +5292,23 @@ extension BLEService {
         )
     }
 
-    /// Group broadcasts are opaque ciphertext to this layer: track them for
-    /// gossip backfill and hand the payload to the UI layer, where the group
-    /// coordinator decrypts and authenticates against the roster. Non-members
-    /// still relay (generic broadcast relay path) but never decode.
-    private func handleGroupMessage(_ packet: BitchatPacket, from _: PeerID) {
+    /// Group broadcasts are opaque ciphertext to this layer: validate the
+    /// outer envelope framing and freshness before admitting them into gossip
+    /// backfill, relaying, or forwarding to the UI layer, where the group
+    /// coordinator decrypts and authenticates against the roster.
+    private func handleGroupMessage(_ packet: BitchatPacket, from _: PeerID) -> Bool {
+        let now = Date()
+        let nowMs = UInt64(now.timeIntervalSince1970 * 1000)
         guard BLEPacketFreshnessPolicy.isBroadcastRecipient(packet.recipientID),
-              !packet.payload.isEmpty else { return }
+              !packet.payload.isEmpty,
+              packet.timestamp <= nowMs &+ TransportConfig.bleMaxTimestampSkewMs,
+              !BLEPacketFreshnessPolicy.isStale(
+                  timestampMilliseconds: packet.timestamp,
+                  now: now,
+                  maxAgeSeconds: 6 * 3600
+              ),
+              let envelope = GroupMessageEnvelope.decode(packet.payload),
+              envelope.ciphertext.count > 16 else { return false }
 
         gossipSyncManager?.onPublicPacketSeen(packet)
 
@@ -5118,6 +5317,7 @@ extension BLEService {
         notifyUI { [weak self] in
             self?.deliverTransportEvent(.groupMessageReceived(payload: payload, timestamp: timestamp))
         }
+        return true
     }
 
     /// Inbound public live-voice packet: broadcast-only, freshness-gated, and

@@ -22,15 +22,15 @@ struct LocationChannelsSheet: View {
     @State private var pickedGeohash: String?
 
     private enum Strings {
-        static let title: LocalizedStringKey = "location_channels.title"
-        static let description: LocalizedStringKey = "location_channels.description"
-        static let requestPermissions: LocalizedStringKey = "location_channels.action.request_permissions"
-        static let permissionDenied: LocalizedStringKey = "location_channels.permission_denied"
-        static let openSettings: LocalizedStringKey = "location_channels.action.open_settings"
-        static let loadingNearby: LocalizedStringKey = "location_channels.loading_nearby"
-        static let grantToFind: LocalizedStringKey = "location_channels.grant_to_find"
-        static let teleport: LocalizedStringKey = "location_channels.action.teleport"
-        static let bookmarked: LocalizedStringKey = "location_channels.bookmarked_section_title"
+        static let title = String(localized: "location_channels.title")
+        static let description = String(localized: "location_channels.description")
+        static let requestPermissions = String(localized: "location_channels.action.request_permissions")
+        static let permissionDenied = String(localized: "location_channels.permission_denied")
+        static let openSettings = String(localized: "location_channels.action.open_settings")
+        static let loadingNearby = String(localized: "location_channels.loading_nearby")
+        static let grantToFind = String(localized: "location_channels.grant_to_find")
+        static let teleport = String(localized: "location_channels.action.teleport")
+        static let bookmarked = String(localized: "location_channels.bookmarked_section_title")
         // Same string the settings pane shows under the tor toggle — the
         // warning belongs wherever the exposure is about to happen.
         static let torOffWarning = String(localized: "app_info.settings.tor.off_warning", defaultValue: "tor is off: every relay you connect to can see your IP address, including relays carrying your private messages.", comment: "Warning shown under the tor toggle while tor is switched off, stating that relay operators can see the device IP address")
@@ -219,7 +219,7 @@ struct LocationChannelsSheet: View {
                 }
                 pendingShareGeohash = nil
             }
-            Button("common.cancel", role: .cancel) {
+            Button(String(localized: "common.cancel"), role: .cancel) {
                 pendingShareGeohash = nil
             }
         } message: {
@@ -447,9 +447,14 @@ struct LocationChannelsSheet: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(Strings.openMap)
                 Button(action: {
-                    let gh = normalized
+                    if normalized.isEmpty {
+                        customError = nil
+                        showGlobePicker = true
+                        return
+                    }
                     guard isValid else { customError = Strings.invalidGeohash; return }
-                    locationChannelsModel.teleport(to: gh)
+                    customError = nil
+                    locationChannelsModel.teleport(to: normalized)
                     isPresented = false
                 }) {
                     HStack(spacing: 6) {
@@ -465,8 +470,7 @@ struct LocationChannelsSheet: View {
                 .padding(.horizontal, 10)
                 .background(palette.secondary.opacity(0.12))
                 .cornerRadius(6)
-                .opacity(isValid ? 1.0 : 0.4)
-                .disabled(!isValid)
+                .opacity(isValid || normalized.isEmpty ? 1.0 : 0.6)
             }
             if let err = customError {
                 Text(err)
